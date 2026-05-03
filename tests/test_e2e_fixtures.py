@@ -97,7 +97,9 @@ def test_fixture_01_clean_resolution(tmp_path, monkeypatch):
 
 def test_fixture_02_no_match_model_keeps_row(tmp_path, monkeypatch):
     """02 has a model with no alias entry. The row must be PRESERVED (raw kept,
-    canonical NULL) — never dropped for unresolved identity."""
+    canonical NULL) — never dropped for unresolved identity. `model_key`
+    falls back to `model_raw` so downstream stages can still address the
+    row."""
     out = _run_pipeline_per_config(tmp_path, monkeypatch, "fixtures_clean")
     df = _facts(out)
 
@@ -107,6 +109,9 @@ def test_fixture_02_no_match_model_keeps_row(tmp_path, monkeypatch):
         # pandas may surface NULL as float NaN — accept either
         row02["model_id"] != row02["model_id"]
     )
+    # model_key is the addressable identifier — non-null for any row that
+    # had a source-supplied name.
+    assert row02["model_key"] == "community/fine-tune-7b"
     assert row02["model_resolution_strategy"] == "no_match"
     # Other entities still resolve
     assert row02["benchmark_id"] == "mmlu"
@@ -115,6 +120,41 @@ def test_fixture_02_no_match_model_keeps_row(tmp_path, monkeypatch):
     assert row02["comparability_group_id"] is None or (
         row02["comparability_group_id"] != row02["comparability_group_id"]
     )
+
+
+def test_fixture_02_unresolved_surfaces_in_models_parquet(tmp_path, monkeypatch):
+    """The unresolved community/fine-tune-7b model must appear in
+    `models.parquet` and `models_view.parquet` — keyed on `model_key`,
+    with `display_name` falling back to the raw source name and
+    `review_status='unresolved'` so consumers can flag it."""
+    pytest.importorskip("duckdb")
+    out = _run_pipeline_per_config(tmp_path, monkeypatch, "fixtures_clean")
+
+    import duckdb
+    con = duckdb.connect()
+    models = con.execute(
+        f"SELECT model_key, model_id, display_name, review_status "
+        f"FROM read_parquet('{out}/models.parquet') "
+        f"WHERE model_key = 'community/fine-tune-7b'"
+    ).fetchone()
+    assert models is not None, "unresolved model dropped from models.parquet"
+    model_key, model_id, display_name, review_status = models
+    assert model_key == "community/fine-tune-7b"
+    assert model_id is None
+    assert display_name == "community/fine-tune-7b"
+    assert review_status == "unresolved"
+
+    view = con.execute(
+        f"SELECT model_key, model_id, route_id, model_name "
+        f"FROM read_parquet('{out}/models_view.parquet') "
+        f"WHERE model_key = 'community/fine-tune-7b'"
+    ).fetchone()
+    assert view is not None, "unresolved model dropped from models_view.parquet"
+    v_model_key, v_model_id, v_route_id, v_model_name = view
+    assert v_model_key == "community/fine-tune-7b"
+    assert v_model_id is None
+    assert v_route_id == "community%2Ffine-tune-7b"
+    assert v_model_name == "community/fine-tune-7b"
 
 
 # ---------------------------------------------------------------------------
@@ -276,3 +316,13 @@ def test_all_configs_run_without_error(tmp_path, monkeypatch):
     assert df["metric_id"].notna().all()       # all metrics resolve
     # Only the community fine-tune fails resolution → 1 row with NULL model_id.
     assert df["model_id"].isna().sum() == 1
+
+    # slice_key / slice_name columns are plumbed through Stages C→D→E→F→I.
+    # Every fixture uses a single benchmark_raw per canonical (e.g. all
+    # mmlu rows write evaluation_name="mmlu"), so the multi-raw heuristic
+    # never fires and both columns are NULL across the corpus. The
+    # multi-raw populated path is covered by tests/test_stage_c_slice.py.
+    assert "slice_key" in df.columns
+    assert "slice_name" in df.columns
+    assert df["slice_key"].isna().all()
+    assert df["slice_name"].isna().all()

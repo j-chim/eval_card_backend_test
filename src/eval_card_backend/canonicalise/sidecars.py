@@ -36,13 +36,15 @@ def write_manifest(con, out_dir: Path, snapshot_meta: dict) -> Path:
     counts = con.execute(
         """
         SELECT
-            COUNT(DISTINCT model_id) FILTER (WHERE model_id IS NOT NULL)
+            -- Use model_key so unresolved models (registry NULL) still
+            -- count toward the corpus headline numbers.
+            COUNT(DISTINCT model_key) FILTER (WHERE model_key IS NOT NULL)
                 AS model_count,
             COUNT(DISTINCT (benchmark_id, metric_id))
                 FILTER (WHERE benchmark_id IS NOT NULL AND metric_id IS NOT NULL)
                 AS eval_count,
-            COUNT(DISTINCT (model_id, benchmark_id, metric_id))
-                FILTER (WHERE model_id     IS NOT NULL
+            COUNT(DISTINCT (model_key, benchmark_id, metric_id))
+                FILTER (WHERE model_key    IS NOT NULL
                         AND   benchmark_id IS NOT NULL
                         AND   metric_id    IS NOT NULL)
                 AS metric_eval_count
@@ -107,7 +109,7 @@ def _reproducibility_block(con, category: str | None) -> dict:
     else:
         cat_join = (
             "JOIN eval_results_view erv "
-            "  ON erv.model_id     = fr.model_id "
+            "  ON erv.model_key    = fr.model_key "
             " AND erv.benchmark_id = fr.benchmark_id "
             " AND erv.metric_id    = fr.metric_id"
         )
@@ -124,13 +126,13 @@ def _reproducibility_block(con, category: str | None) -> dict:
     triple_rollup_sql = f"""
         WITH triple_rollups AS (
             SELECT
-                fr.model_id, fr.benchmark_id, fr.metric_id,
+                fr.model_key, fr.benchmark_id, fr.metric_id,
                 BOOL_OR(fr.has_reproducibility_gap) AS triple_has_gap,
                 BOOL_OR(fr.is_agentic)              AS triple_agentic,
                 {field_flags_sql}
             FROM fact_results fr
             {cat_join}
-            WHERE fr.model_id     IS NOT NULL
+            WHERE fr.model_key    IS NOT NULL
               AND fr.benchmark_id IS NOT NULL
               AND fr.metric_id    IS NOT NULL
               {cat_where}
@@ -195,7 +197,7 @@ def _completeness_block(con, category: str | None) -> dict:
         f"""
         WITH triple_rollups AS (
             SELECT
-                erv.model_id, erv.benchmark_id, erv.metric_id,
+                erv.model_key, erv.benchmark_id, erv.metric_id,
                 erv.completeness_score AS triple_avg_completeness
             FROM eval_results_view erv
             WHERE 1 = 1 {cat_clause}
@@ -280,7 +282,7 @@ def _developers_list(con) -> list[dict]:
         """
         SELECT
             developer,
-            COUNT(DISTINCT model_id)                                     AS model_count,
+            COUNT(DISTINCT model_key)                                    AS model_count,
             COUNT(DISTINCT benchmark_id) FILTER (WHERE benchmark_id IS NOT NULL) AS benchmark_count,
             COUNT(*)                                                     AS evaluation_count
         FROM models_view
@@ -311,7 +313,7 @@ def _families_list(con) -> list[dict]:
         SELECT
             model_family_id   AS family_key,
             ANY_VALUE(model_family_name) AS display_name,
-            COUNT(DISTINCT model_id)     AS model_count,
+            COUNT(DISTINCT model_key)    AS model_count,
             SUM(evaluations_count)       AS eval_count
         FROM models_view
         WHERE model_family_id IS NOT NULL
@@ -335,7 +337,7 @@ def _categories_list(con) -> list[dict]:
         """
         SELECT
             category,
-            COUNT(DISTINCT model_id)                AS model_count,
+            COUNT(DISTINCT model_key)               AS model_count,
             COUNT(DISTINCT (benchmark_id, metric_id)) AS eval_count
         FROM eval_results_view
         WHERE category IS NOT NULL
@@ -385,10 +387,11 @@ def write_headline(con, out_dir: Path, snapshot_meta: dict) -> Path:
 def write_hierarchy(con, out_dir: Path, snapshot_meta: dict) -> Path:
     """Six-level rollout tree.
 
-    Today's data carries family + composite + leaf benchmark + metric;
-    `slices[]` is empty pending fact_results carrying a `slice_key`
-    column. The structural shape is honoured so the frontend can render
-    against it now and slices fill in later.
+    Family + composite + leaf benchmark + slice + metric. Slices are the
+    within-benchmark subdivisions the registry collapses to one canonical
+    (e.g. MMLU subjects, MMLU-Pro categories — see Stage C
+    `_apply_slice_key`). Benchmarks with no fan-out emit an empty
+    `slices[]`.
     """
     stats = _hierarchy_stats(con)
     families = _hierarchy_families(con)
@@ -417,13 +420,16 @@ def _hierarchy_stats(con) -> dict:
               - (SELECT COUNT(*) FROM composites)                     AS standalone_benchmark_count,
             (SELECT COUNT(*) FROM benchmarks
               WHERE parent_benchmark_id IS NOT NULL)                  AS single_benchmark_count,
-            0                                                          AS slice_count,
+            (SELECT COUNT(DISTINCT (benchmark_id, slice_key))
+                 FROM fact_results
+                 WHERE benchmark_id IS NOT NULL
+                   AND slice_key    IS NOT NULL)                      AS slice_count,
             (SELECT COUNT(DISTINCT (benchmark_id, metric_id))
                  FROM fact_results
                  WHERE benchmark_id IS NOT NULL AND metric_id IS NOT NULL) AS metric_count,
-            (SELECT COUNT(DISTINCT (model_id, benchmark_id, metric_id))
+            (SELECT COUNT(DISTINCT (model_key, benchmark_id, metric_id))
                  FROM fact_results
-                 WHERE model_id IS NOT NULL AND benchmark_id IS NOT NULL AND metric_id IS NOT NULL)
+                 WHERE model_key IS NOT NULL AND benchmark_id IS NOT NULL AND metric_id IS NOT NULL)
                                                                        AS metric_rows_scanned
         """
     ).fetchone()
@@ -582,7 +588,7 @@ def _hierarchy_benchmark_record(con, child_row) -> dict:
         """
         SELECT metric_id,
                ANY_VALUE(metric_display_name) AS display_name,
-               COUNT(DISTINCT model_id)       AS models_count,
+               COUNT(DISTINCT model_key)      AS models_count,
                ARRAY_AGG(DISTINCT source_metadata.source_organization_name)
                    FILTER (WHERE source_metadata.source_organization_name IS NOT NULL)
                    AS sources
@@ -608,7 +614,7 @@ def _hierarchy_benchmark_record(con, child_row) -> dict:
             "languages": languages or [],
             "tasks":     tasks     or [],
         },
-        "slices":  [],   # no slice support yet
+        "slices":  _hierarchy_benchmark_slices(con, benchmark_id),
         "metrics": [
             {
                 "key":          m[0],
@@ -622,6 +628,66 @@ def _hierarchy_benchmark_record(con, child_row) -> dict:
         "provenance_summary":      _benchmark_signal_summary(con, benchmark_id, "provenance_summary"),
         "comparability_summary":   _benchmark_signal_summary(con, benchmark_id, "comparability_summary"),
     }
+
+
+def _hierarchy_benchmark_slices(con, benchmark_id: str) -> list[dict]:
+    """Per-benchmark slices[] for the family-table hierarchy.
+
+    Reads `fact_results` directly because `eval_results_view` collapses
+    triples on `(model_key, benchmark_id, metric_id)` — slice_key is not
+    part of that grouping. Aggregates metrics within each slice for the
+    frontend's HierarchySlice shape: `{key, display_name, metrics[]}`.
+
+    `slice_name` is reduced via MIN for determinism — case-only variants
+    ('MMLU' / 'mmlu') already collapse to one slice_key in Stage C, but
+    multiple rows in the same slice may carry different casings of the
+    raw, so we pick the lexicographically earliest as the representative.
+    """
+    rows = con.execute(
+        """
+        WITH per_slice_metric AS (
+            SELECT
+                fr.slice_key,
+                fr.metric_id,
+                MIN(fr.slice_name)                       AS slice_name_rep,
+                ANY_VALUE(cmet.display_name)             AS metric_display,
+                ARRAY_AGG(DISTINCT fr.org_raw)
+                    FILTER (WHERE fr.org_raw IS NOT NULL) AS sources
+            FROM fact_results fr
+            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_id
+            WHERE fr.benchmark_id = ?
+              AND fr.slice_key IS NOT NULL
+              AND fr.metric_id IS NOT NULL
+            GROUP BY fr.slice_key, fr.metric_id
+        )
+        SELECT
+            slice_key,
+            MIN(slice_name_rep) AS slice_display_name,
+            ARRAY_AGG(struct_pack(
+                metric_id      := metric_id,
+                metric_display := metric_display,
+                sources        := sources
+            ) ORDER BY metric_id) AS metrics
+        FROM per_slice_metric
+        GROUP BY slice_key
+        ORDER BY slice_key
+        """, [benchmark_id]
+    ).fetchall()
+    return [
+        {
+            "key":          row[0],
+            "display_name": row[1] or row[0],
+            "metrics": [
+                {
+                    "key":          m["metric_id"],
+                    "display_name": m["metric_display"] or m["metric_id"],
+                    "sources":      m["sources"] or [],
+                }
+                for m in row[2]
+            ],
+        }
+        for row in rows
+    ]
 
 
 def _benchmark_signal_summary(con, benchmark_id: str, summary_field: str) -> dict | None:

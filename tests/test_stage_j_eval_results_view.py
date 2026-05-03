@@ -140,17 +140,21 @@ def test_metric_summary_id_round_trips(tmp_path, monkeypatch):
 
 
 def test_model_route_id_round_trips(tmp_path, monkeypatch):
-    """model_route_id is url_encode(model_id); slashes → %2F."""
+    """model_route_id is url_encode(model_key); slashes → %2F. Resolved
+    models have model_key == model_id; unresolved fall back to model_raw
+    so the view is still addressable for them."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_view(out)
     rows = con.execute(
-        "SELECT model_id, model_route_id FROM eval_results_view"
+        "SELECT model_key, model_id, model_route_id FROM eval_results_view"
     ).fetchall()
-    for model_id, slug in rows:
-        assert unquote(slug) == model_id
-        if "/" in model_id:
+    for model_key, model_id, slug in rows:
+        assert unquote(slug) == model_key
+        if "/" in model_key:
             assert "%2F" in slug
+        # Resolved → model_id matches model_key; unresolved → model_id is NULL.
+        assert model_id is None or model_id == model_key
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +192,11 @@ def test_score_prefers_first_party_when_third_party_diverges(tmp_path, monkeypat
     assert fact_row_count == 2
 
 
-def test_position_total_percentile_single_model(tmp_path, monkeypatch):
-    """Single model on a benchmark/metric → position=1, total=1, percentile=NULL
-    (no peers to rank against)."""
+def test_position_total_percentile_with_unresolved_peer(tmp_path, monkeypatch):
+    """gpt-4o (resolved, score=0.85) and community/fine-tune-7b (unresolved,
+    score=0.4) share the mmlu/mmlu.acc triple in fixtures_clean. The
+    unresolved peer now contributes to ranking — the view no longer drops
+    NULL-model_id rows."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_view(out)
@@ -198,10 +204,17 @@ def test_position_total_percentile_single_model(tmp_path, monkeypatch):
         "SELECT position, total, percentile FROM eval_results_view "
         "WHERE model_id = 'openai/gpt-4o'"
     ).fetchone()
-    pos, total, pct = row
-    assert pos == 1
-    assert total == 1
-    assert pct is None
+    pos, total, _pct = row
+    assert pos == 1, "gpt-4o has the higher score → rank 1"
+    assert total == 2, "fixture pairs gpt-4o with the unresolved fine-tune-7b"
+
+    # The unresolved peer is also rankable now.
+    unresolved_row = con.execute(
+        "SELECT position, total FROM eval_results_view "
+        "WHERE model_key = 'community/fine-tune-7b' AND model_id IS NULL"
+    ).fetchone()
+    assert unresolved_row is not None
+    assert unresolved_row == (2, 2)
 
 
 def test_coverage_cell_self_when_only_first_party(tmp_path, monkeypatch):

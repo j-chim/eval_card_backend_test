@@ -63,7 +63,7 @@ def test_models_view_columns_match_spec(tmp_path, monkeypatch):
     cols = {row[0]: row[1] for row in con.execute("DESCRIBE models_view").fetchall()}
 
     expected = {
-        "snapshot_id", "model_id", "id", "route_id", "model_route_id",
+        "snapshot_id", "model_key", "model_id", "id", "route_id", "model_route_id",
         "model_family_id", "model_name", "canonical_model_name",
         "model_family_name", "developer",
         "release_date", "model_url", "architecture", "params",
@@ -90,13 +90,22 @@ def test_models_view_columns_match_spec(tmp_path, monkeypatch):
 
 
 def test_route_id_round_trips(tmp_path, monkeypatch):
+    """`route_id` derives from `model_key`, not `model_id`. For resolved
+    models the two coincide; for unresolved (registry NULL) `model_key`
+    falls back to `model_raw` so the row is still addressable. The
+    round-trip is therefore against `model_key`."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_views(out)
-    rows = con.execute("SELECT model_id, route_id, model_route_id FROM models_view").fetchall()
-    for model_id, route_id, model_route_id in rows:
+    rows = con.execute(
+        "SELECT model_key, model_id, route_id, model_route_id FROM models_view"
+    ).fetchall()
+    for model_key, model_id, route_id, model_route_id in rows:
         assert route_id == model_route_id, "model_route_id is an alias of route_id"
-        assert unquote(route_id) == model_id
+        assert unquote(route_id) == model_key
+        # Resolved → model_id matches model_key; unresolved → model_id is NULL
+        # while model_key carries the raw source name.
+        assert model_id is None or model_id == model_key
 
 
 def test_aggregations_match_fact_counts(tmp_path, monkeypatch):

@@ -549,6 +549,50 @@ def stage_c_resolve_identities(con) -> None:
         """
     )
 
+    _apply_slice_key(con)
+
+
+def _apply_slice_key(con) -> None:
+    """Derive `slice_key` / `slice_name` on `results_resolved`.
+
+    A slice is a within-benchmark subdivision that the registry collapses to
+    one canonical: e.g. EEE rows with `evaluation_name` = "Abstract Algebra",
+    "Anatomy", "Astronomy" all resolve to canonical_benchmark_id = `mmlu`.
+    Without a slice column, downstream signals fold those rows into one
+    group keyed on (model, mmlu, accuracy) and treat the natural cross-
+    subject score spread as variant divergence — wrong, and headline on
+    the divergence-magnitude leaderboard.
+
+    Heuristic: the cleaned `benchmark_raw` is the slice when ≥2 distinct
+    cleaned-and-normalised raws map to the same `benchmark_id` within the
+    snapshot. Single-raw benchmarks get NULL — there's no slice axis to
+    differentiate.
+
+    `slice_key` is the case-insensitive normalised form ("Anatomy" and
+    "anatomy" collapse to one slice). `slice_name` keeps the per-row raw
+    casing for display; downstream picks a deterministic representative
+    per slice_key when rendering.
+    """
+    con.execute("ALTER TABLE results_resolved ADD COLUMN slice_key VARCHAR")
+    con.execute("ALTER TABLE results_resolved ADD COLUMN slice_name VARCHAR")
+    con.execute(
+        """
+        UPDATE results_resolved
+        SET slice_key  = LOWER(TRIM(results_resolved.benchmark_raw)),
+            slice_name = results_resolved.benchmark_raw
+        FROM (
+            SELECT benchmark_id
+            FROM results_resolved
+            WHERE benchmark_id  IS NOT NULL
+              AND benchmark_raw IS NOT NULL
+            GROUP BY benchmark_id
+            HAVING COUNT(DISTINCT LOWER(TRIM(benchmark_raw))) >= 2
+        ) AS multi_slice
+        WHERE results_resolved.benchmark_id  = multi_slice.benchmark_id
+          AND results_resolved.benchmark_raw IS NOT NULL
+        """
+    )
+
 
 # ---------------------------------------------------------------------------
 # Stage D — flatten + join canonical dims
@@ -604,6 +648,7 @@ def stage_d_join_dims_and_flatten(con) -> None:
 
             j.model_raw,     j.model_id,
             j.benchmark_raw, j.benchmark_id,
+            j.slice_key,     j.slice_name,
             j.metric_raw,    j.metric_id,
             j.org_raw,       j.org_id,
             j.harness_raw,   j.harness_id,
@@ -953,13 +998,20 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
     )
 
     # F.4 — final fact_results: union resolved-with-group-signals + unresolved passthrough
+    #
+    # `model_key = COALESCE(model_id, model_raw)` is the row's addressable
+    # identifier. `model_id` stays nullable (canonical-only); `model_key`
+    # is non-null whenever the source supplied any model name. Downstream
+    # stages key joins/groups/routes on `model_key` so unresolved models
+    # surface as first-class records instead of being silently dropped.
     con.execute(
         f"""
         CREATE TABLE fact_results AS
         SELECT
             TIMESTAMP '{snapshot_id_to_sql(snapshot_id)}' AS snapshot_id,
             * EXCLUDE (card_payload, org_normalized_key, generation_args_json,
-                       _completeness)
+                       _completeness),
+            COALESCE(model_id, model_raw) AS model_key
         FROM fact_results_grouped_annotated
 
         UNION ALL BY NAME
@@ -967,6 +1019,7 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
         SELECT
             TIMESTAMP '{snapshot_id_to_sql(snapshot_id)}' AS snapshot_id,
             fr.* EXCLUDE (card_payload, generation_args_json, _completeness),
+            COALESCE(fr.model_id, fr.model_raw)                AS model_key,
             CAST(NULL AS INTEGER)                              AS distinct_reporting_orgs,
             CAST(NULL AS VARCHAR)                              AS comparability_group_id,
             CAST(NULL AS BOOLEAN)                              AS is_multi_source,
@@ -1121,17 +1174,30 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
         """
     )
 
-    # models.parquet — registry now carries lineage as a typed `parents`
-    # JSON list and surfaces release_date / open_weights / params_billions
-    # / lineage_origin_org_id / root_model_id directly.
+    # models.parquet — keyed on `model_key` so unresolved models (no
+    # registry match) surface as first-class rows rather than being
+    # filtered out. `model_id` stays nullable (canonical-only). Registry
+    # fields fall through to NULL for unresolved; `display_name` falls
+    # back to the raw source name; `review_status` is 'unresolved' so
+    # consumers can flag the row visually if they want.
     con.execute(
         f"""
         CREATE TABLE models AS
+        WITH used_models AS (
+            SELECT
+                model_key,
+                ANY_VALUE(model_id)                          AS model_id,
+                ANY_VALUE(model_raw)                         AS model_raw
+            FROM fact_results
+            WHERE model_key IS NOT NULL
+            GROUP BY model_key
+        )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
-            cm.id AS model_id,
+            um.model_key,
+            um.model_id,
 
-            cm.display_name,
+            COALESCE(cm.display_name, um.model_raw)         AS display_name,
             cm.developer,
             cm.org_id,
             cm.family,
@@ -1142,10 +1208,10 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             cm.lineage_origin_org_id,
             cm.open_weights,
             cm.release_date,
-            cm.parents                                              AS lineage_parents,
+            cm.parents                                       AS lineage_parents,
             TRY_CAST(from_json(cm.tags, '["VARCHAR"]') AS VARCHAR[]) AS registry_tags,
-            TRY_CAST(cm.metadata AS JSON) AS registry_metadata,
-            cm.review_status,
+            TRY_CAST(cm.metadata AS JSON)                    AS registry_metadata,
+            COALESCE(cm.review_status, 'unresolved')         AS review_status,
 
             co.display_name        AS org_display_name,
             co.website             AS org_website,
@@ -1153,10 +1219,9 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             co.kind                AS org_kind,
             co.parent_org_id       AS org_parent_id
 
-        FROM canonical_models cm
-        LEFT JOIN canonical_orgs co ON co.id = cm.org_id
-        WHERE cm.id IN (SELECT DISTINCT model_id FROM fact_results
-                        WHERE model_id IS NOT NULL)
+        FROM used_models um
+        LEFT JOIN canonical_models cm ON cm.id = um.model_id
+        LEFT JOIN canonical_orgs co   ON co.id = cm.org_id
         """
     )
 
@@ -1176,9 +1241,9 @@ def stage_i_emit_warehouse_parquets(con, out_dir: Path, snapshot_id: str) -> Non
     out_dir.mkdir(parents=True, exist_ok=True)
     sid = snapshot_id_to_sql(snapshot_id)
     for table, sort_key in [
-        ("fact_results", "(model_id, benchmark_id, metric_id)"),
+        ("fact_results", "(model_key, benchmark_id, metric_id)"),
         ("benchmarks", "(benchmark_id)"),
-        ("models", "(model_id)"),
+        ("models", "(model_key)"),
     ]:
         path = out_dir / f"{table}.parquet"
         con.execute(
@@ -1290,15 +1355,18 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             FROM benchmarks
         ),
         tris AS (
+            -- Unresolved models (model_id IS NULL) still flow through:
+            -- group/partition/join keys all use `model_key` which is
+            -- `COALESCE(model_id, model_raw)` and non-null by construction.
             SELECT *
             FROM fact_results
-            WHERE model_id     IS NOT NULL
+            WHERE model_key    IS NOT NULL
               AND benchmark_id IS NOT NULL
               AND metric_id    IS NOT NULL
         ),
         tri_agg AS (
             SELECT
-                model_id, benchmark_id, metric_id,
+                model_key, model_id, benchmark_id, metric_id,
                 CAST(COUNT(*) AS INTEGER) AS fact_row_count,
                 -- Median rule: prefer first-party scores; fall back to all rows.
                 COALESCE(
@@ -1335,14 +1403,17 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 BOOL_OR(has_reproducibility_gap)         AS triple_has_repro_gap,
                 AVG(completeness_score)                  AS triple_avg_completeness
             FROM tris
-            GROUP BY 1, 2, 3
+            -- model_id is functionally dependent on model_key (model_key =
+            -- COALESCE(model_id, model_raw)), so grouping by both keeps
+            -- cardinality identical and lets the SELECT pass model_id through.
+            GROUP BY model_key, model_id, benchmark_id, metric_id
         ),
         tri_rep_ranked AS (
             -- Pick one representative fact row per triple.
             -- Order: scored rows first → first-party first → lowest evaluation_id.
             SELECT *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY model_id, benchmark_id, metric_id
+                    PARTITION BY model_key, benchmark_id, metric_id
                     ORDER BY
                         CASE WHEN score IS NULL THEN 1 ELSE 0 END ASC,
                         CASE WHEN evaluator_relationship = 'first_party' THEN 0 ELSE 1 END ASC,
@@ -1392,8 +1463,8 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 b.parent_benchmark_id         AS b_parent_benchmark_id,
                 bc.category                   AS b_category
             FROM tri_agg ta
-            JOIN tri_rep tr USING (model_id, benchmark_id, metric_id)
-            LEFT JOIN models m              ON m.model_id     = ta.model_id
+            JOIN tri_rep tr USING (model_key, benchmark_id, metric_id)
+            LEFT JOIN models m              ON m.model_key    = ta.model_key
             LEFT JOIN benchmarks b          ON b.benchmark_id = ta.benchmark_id
             LEFT JOIN benchmark_categories bc ON bc.benchmark_id = ta.benchmark_id
             LEFT JOIN canonical_metrics cmet ON cmet.id       = ta.metric_id
@@ -1413,7 +1484,7 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                                  THEN rep_score
                                  ELSE -rep_score
                             END ASC,
-                            model_id ASC
+                            model_key ASC
                     ) AS INTEGER)
                 END AS position,
                 CAST(COUNT(rep_score) OVER (
@@ -1427,13 +1498,16 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             metric_summary_id_udf(benchmark_id, metric_id)       AS metric_summary_id,
             benchmark_id,
             metric_id,
+            model_key,
             model_id,
-            url_encode_udf(model_id)                             AS model_route_id,
+            url_encode_udf(model_key)                            AS model_route_id,
 
-            -- model_info: denormalised display context
+            -- model_info: denormalised display context. `id` reflects the
+            -- canonical id when known and falls back to the raw source name
+            -- so unresolved models still expose a stable identifier.
             CAST({{
                 'name':              COALESCE(m_display_name, rep_model_raw),
-                'id':                model_id,
+                'id':                COALESCE(model_id, rep_model_raw),
                 'developer':         COALESCE(m_org_display_name, m_developer),
                 'inference_platform': NULL,
                 'inference_engine':   NULL,
@@ -1582,7 +1656,7 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             rep_instance_file_format AS instance_file_format,
             rep_instance_rows        AS instance_rows
         FROM ranked
-        ORDER BY metric_summary_id, model_id
+        ORDER BY metric_summary_id, model_key
         """
     )
 
@@ -1611,8 +1685,10 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         WITH fact_aggs AS (
             -- Per-fact-row rollups: evidence_count, variant_count_setup,
             -- generation-config gaps, latest timestamp, evaluator names.
+            -- Keyed on `model_key` so unresolved models are aggregated as
+            -- their own rows rather than being silently dropped.
             SELECT
-                model_id,
+                model_key,
                 CAST(COUNT(*) AS BIGINT)                    AS evidence_count,
                 CAST(COUNT(DISTINCT variant_key) AS INTEGER) AS variant_count,
                 CAST(COUNT(*) FILTER (
@@ -1641,7 +1717,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                        OR eval_library_version IS NOT NULL
                 )                                             AS eval_libraries
             FROM fact_results
-            WHERE model_id IS NOT NULL
+            WHERE model_key IS NOT NULL
             GROUP BY 1
         ),
         triple_aggs AS (
@@ -1650,7 +1726,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
             -- third-party coverage, signal flags, score summary, category
             -- breakdown.
             SELECT
-                model_id,
+                model_key,
                 CAST(COUNT(*) AS BIGINT)                                  AS evaluations_count,
                 CAST(COUNT(DISTINCT benchmark_id) AS BIGINT)              AS benchmarks_count,
                 CAST(COUNT(*) FILTER (WHERE coverage_cell IN ('third', 'both')) AS BIGINT)
@@ -1689,7 +1765,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         ),
         benchmark_names AS (
             SELECT
-                erv.model_id,
+                erv.model_key,
                 ARRAY_AGG(DISTINCT b.display_name)
                     FILTER (WHERE b.display_name IS NOT NULL) AS benchmark_names
             FROM eval_results_view erv
@@ -1699,14 +1775,14 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         ranked_for_top AS (
             -- For each (model, category), rank rows by score (lower_is_better aware).
             SELECT
-                erv.model_id,
+                erv.model_key,
                 erv.category,
                 COALESCE(b.display_name, erv.benchmark_id) AS benchmark_display,
                 erv.evaluation_id                          AS benchmark_key,
                 erv.score,
                 erv.metric_display_name,
                 ROW_NUMBER() OVER (
-                    PARTITION BY erv.model_id, erv.category
+                    PARTITION BY erv.model_key, erv.category
                     ORDER BY
                         CASE WHEN COALESCE(erv.lower_is_better, FALSE)
                              THEN erv.score ELSE -erv.score
@@ -1720,7 +1796,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         ),
         top_scores AS (
             SELECT
-                model_id,
+                model_key,
                 ARRAY_AGG(struct_pack(
                     benchmark    := benchmark_display,
                     benchmarkKey := benchmark_key,
@@ -1733,7 +1809,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         ),
         link_rollups AS (
             SELECT
-                model_id,
+                model_key,
                 ARRAY_AGG(DISTINCT source_metadata.source_organization_url)
                     FILTER (WHERE source_metadata.source_organization_url IS NOT NULL)
                     AS source_urls
@@ -1742,11 +1818,12 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
+            m.model_key,
             m.model_id,
-            m.model_id                                  AS id,
-            url_encode_udf(m.model_id)                  AS route_id,
-            url_encode_udf(m.model_id)                  AS model_route_id,
-            COALESCE(m.parent_model_id, m.model_id)     AS model_family_id,
+            m.model_key                                 AS id,
+            url_encode_udf(m.model_key)                 AS route_id,
+            url_encode_udf(m.model_key)                 AS model_route_id,
+            COALESCE(m.parent_model_id, m.model_key)    AS model_family_id,
 
             m.display_name                              AS model_name,
             m.display_name                              AS canonical_model_name,
@@ -1847,12 +1924,12 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
 
             -- variants[]: single self-entry for v1 — see function docstring.
             [CAST({{
-                'variant_id':           m.model_id,
-                'variant_key':          url_encode_udf(m.model_id),
+                'variant_id':           m.model_key,
+                'variant_key':          url_encode_udf(m.model_key),
                 'variant_label':        m.display_name,
                 'variant_display_name': m.display_name,
                 'raw_model_ids':        fa.raw_model_ids,
-                'family_id':            COALESCE(m.parent_model_id, m.model_id),
+                'family_id':            COALESCE(m.parent_model_id, m.model_key),
                 'family_name':          m.family,
                 'version_date':         CAST(NULL AS VARCHAR),
                 'version_qualifier':    CAST(NULL AS VARCHAR),
@@ -1870,12 +1947,12 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
 
             fa.raw_model_ids
         FROM models m
-        LEFT JOIN fact_aggs    fa ON fa.model_id = m.model_id
-        LEFT JOIN triple_aggs  ta ON ta.model_id = m.model_id
-        LEFT JOIN benchmark_names bn ON bn.model_id = m.model_id
-        LEFT JOIN top_scores   ts ON ts.model_id = m.model_id
-        LEFT JOIN link_rollups lr ON lr.model_id = m.model_id
-        ORDER BY m.model_id
+        LEFT JOIN fact_aggs    fa ON fa.model_key = m.model_key
+        LEFT JOIN triple_aggs  ta ON ta.model_key = m.model_key
+        LEFT JOIN benchmark_names bn ON bn.model_key = m.model_key
+        LEFT JOIN top_scores   ts ON ts.model_key = m.model_key
+        LEFT JOIN link_rollups lr ON lr.model_key = m.model_key
+        ORDER BY m.model_key
         """
     )
 
@@ -1896,9 +1973,16 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
     Depends on `eval_results_view` already being materialised on the
     connection.
 
-    `subtasks[]` is empty in v1 — fact_results doesn't carry a slice_key
-    today. Same for `aggregate_sources[]` (suite rollup is not yet
-    tracked) and `is_aggregated` (always false).
+    `subtasks[]` rolls up per-slice metric aggregations from
+    `fact_results` directly (eval_results_view's triple-grouping doesn't
+    carry slice_key — see Stage C `_apply_slice_key`). One subtask per
+    distinct `(benchmark_id, slice_key)` with non-null slice_key; each
+    subtask's `metrics[]` mirrors the root benchmark's `root_metrics[]`
+    shape (display, models_count, top_score, etc.) so the frontend's
+    subtask breakdown panel renders the same way as the root listing.
+
+    `aggregate_sources[]` (suite rollup) is not yet tracked, and
+    `is_aggregated` is always false.
     """
     sid = snapshot_id_to_sql(snapshot_id)
 
@@ -1959,7 +2043,7 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 ANY_VALUE(erv.metric_display_name) AS metric_display_name,
                 ANY_VALUE(erv.metric_unit)         AS metric_unit,
                 ANY_VALUE(erv.lower_is_better)     AS lower_is_better,
-                COUNT(DISTINCT erv.model_id)       AS metric_models_count,
+                COUNT(DISTINCT erv.model_key)      AS metric_models_count,
                 CASE WHEN COALESCE(ANY_VALUE(erv.lower_is_better), FALSE)
                      THEN MIN(erv.score) ELSE MAX(erv.score) END AS top_score
             FROM eval_results_view erv
@@ -2016,7 +2100,7 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             -- COUNTs are accurate.
             SELECT
                 pt.benchmark_id,
-                CAST(COUNT(DISTINCT pt.model_id) AS BIGINT)            AS models_count,
+                CAST(COUNT(DISTINCT pt.model_key) AS BIGINT)           AS models_count,
                 arg_max(pt.source_metadata.source_organization_name,
                         pt.evaluation_timestamp)                       AS latest_source_name,
                 AVG(CASE WHEN pt.coverage_cell IN ('third', 'both')
@@ -2028,8 +2112,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 AVG(pt.score)                                          AS avg_score,
                 MIN(pt.score)                                          AS min_score_seen,
                 MAX(pt.score)                                          AS max_score_seen,
-                arg_max(pt.model_id, pt.scoring_score)                 AS top_model_id,
-                arg_min(pt.model_id, pt.scoring_score)                 AS bottom_model_id,
+                -- top/bottom are addressable identifiers — use model_key so
+                -- unresolved models can also occupy these slots and the
+                -- downstream JOIN to `models` resolves their display name.
+                arg_max(pt.model_key, pt.scoring_score)                AS top_model_id,
+                arg_min(pt.model_key, pt.scoring_score)                AS bottom_model_id,
                 AVG(CASE WHEN pt.has_reproducibility_gap THEN 1.0 ELSE 0.0 END)
                                                                        AS gap_rate,
                 CAST(SUM(CASE WHEN pt.has_reproducibility_gap THEN 1 ELSE 0 END) AS INTEGER)
@@ -2088,11 +2175,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             GROUP BY pm.benchmark_id
         ),
         leaderboard_per_model AS (
-            -- One row per (benchmark_id, model_id) carrying its values map across
+            -- One row per (benchmark_id, model_key) carrying its values map across
             -- all metrics on that benchmark.
             SELECT
                 erv.benchmark_id,
-                erv.model_id,
+                erv.model_key,
                 ANY_VALUE(erv.model_route_id)                  AS model_route_id,
                 ANY_VALUE(erv.model_info)                      AS model_info,
                 ANY_VALUE(erv.evaluation_timestamp)            AS evaluation_timestamp,
@@ -2117,7 +2204,7 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     source_data          := source_data,
                     "values"             := values_map,
                     metrics_present      := metrics_present
-                ) ORDER BY model_id) AS leaderboard_rows
+                ) ORDER BY model_key) AS leaderboard_rows
             FROM leaderboard_per_model
             GROUP BY 1
         ),
@@ -2131,11 +2218,73 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                           ORDER BY erv.instance_file_path)
                     FILTER (WHERE erv.instance_file_path IS NOT NULL)
                     AS sample_urls_full,
-                CAST(COUNT(DISTINCT erv.model_id)
+                CAST(COUNT(DISTINCT erv.model_key)
                      FILTER (WHERE erv.instance_file_path IS NOT NULL) AS INTEGER)
                     AS models_with_loaded_instances
             FROM eval_results_view erv
             GROUP BY 1
+        ),
+        per_slice_metric AS (
+            -- One row per (benchmark_id, slice_key, metric_id). Reads
+            -- from fact_results because eval_results_view collapses on
+            -- (model_key, benchmark_id, metric_id) and doesn't carry
+            -- slice_key. Mirrors the per_metric CTE above so the
+            -- subtask metrics list matches root_metrics field-for-field.
+            SELECT
+                fr.benchmark_id,
+                fr.slice_key,
+                fr.metric_id,
+                MIN(fr.slice_name)                 AS slice_name_rep,
+                ANY_VALUE(cmet.display_name)       AS metric_display_name,
+                ANY_VALUE(fr.metric_unit)          AS metric_unit,
+                ANY_VALUE(fr.lower_is_better)      AS lower_is_better,
+                CAST(COUNT(DISTINCT fr.model_key) AS INTEGER) AS metric_models_count,
+                CASE WHEN COALESCE(ANY_VALUE(fr.lower_is_better), FALSE)
+                     THEN MIN(fr.score) ELSE MAX(fr.score) END AS top_score
+            FROM fact_results fr
+            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_id
+            WHERE fr.benchmark_id IS NOT NULL
+              AND fr.slice_key    IS NOT NULL
+              AND fr.metric_id    IS NOT NULL
+              AND fr.model_key    IS NOT NULL
+            GROUP BY 1, 2, 3
+        ),
+        slice_metrics_agg AS (
+            -- One row per (benchmark_id, slice_key) — metrics rolled into
+            -- a struct array. Deterministic ordering by metric_id.
+            SELECT
+                benchmark_id,
+                slice_key,
+                MIN(slice_name_rep) AS slice_name_rep,
+                ARRAY_AGG(struct_pack(
+                    metric_summary_id      := metric_summary_id_udf(
+                                                  benchmark_id, metric_id),
+                    metric_name            := metric_display_name,
+                    display_name           := metric_display_name,
+                    canonical_display_name := metric_display_name,
+                    metric_key             := metric_id,
+                    lower_is_better        := lower_is_better,
+                    models_count           := metric_models_count,
+                    top_score              := top_score,
+                    unit                   := metric_unit
+                ) ORDER BY metric_id) AS metrics
+            FROM per_slice_metric
+            GROUP BY benchmark_id, slice_key
+        ),
+        subtasks_agg AS (
+            -- One row per benchmark — slices rolled into a struct array.
+            SELECT
+                benchmark_id,
+                ARRAY_AGG(struct_pack(
+                    subtask_key            := slice_key,
+                    subtask_name           := slice_name_rep,
+                    display_name           := slice_name_rep,
+                    canonical_display_name := slice_name_rep,
+                    metrics                := metrics
+                ) ORDER BY slice_key) AS subtasks,
+                CAST(COUNT(*) AS INTEGER) AS subtasks_count
+            FROM slice_metrics_agg
+            GROUP BY benchmark_id
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
@@ -2314,7 +2463,19 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
 
             lma.root_metrics,
 
-            CAST([] AS STRUCT(
+            CAST(COALESCE(
+                sub.subtasks,
+                CAST([] AS STRUCT(
+                    subtask_key VARCHAR, subtask_name VARCHAR, display_name VARCHAR,
+                    canonical_display_name VARCHAR,
+                    metrics STRUCT(
+                        metric_summary_id VARCHAR, metric_name VARCHAR,
+                        display_name VARCHAR, canonical_display_name VARCHAR,
+                        metric_key VARCHAR, lower_is_better BOOLEAN,
+                        models_count INTEGER, top_score DOUBLE, unit VARCHAR
+                    )[]
+                )[])
+            ) AS STRUCT(
                 subtask_key VARCHAR, subtask_name VARCHAR, display_name VARCHAR,
                 canonical_display_name VARCHAR,
                 metrics STRUCT(
@@ -2324,18 +2485,19 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     models_count INTEGER, top_score DOUBLE, unit VARCHAR
                 )[]
             )[])                                         AS subtasks,
-            CAST(0 AS INTEGER)                           AS subtasks_count
+            COALESCE(sub.subtasks_count, 0)              AS subtasks_count
         FROM benchmarks b
         LEFT JOIN primary_metric pm     ON pm.benchmark_id = b.benchmark_id
         LEFT JOIN canonical_metrics cmet ON cmet.id = pm.metric_id
         LEFT JOIN primary_facts pf      ON pf.benchmark_id = b.benchmark_id
         LEFT JOIN evaluator_names_agg ena ON ena.benchmark_id = b.benchmark_id
         LEFT JOIN source_types_agg    sta ON sta.benchmark_id = b.benchmark_id
-        LEFT JOIN models top_m          ON top_m.model_id = pf.top_model_id
-        LEFT JOIN models bot_m          ON bot_m.model_id = pf.bottom_model_id
+        LEFT JOIN models top_m          ON top_m.model_key = pf.top_model_id
+        LEFT JOIN models bot_m          ON bot_m.model_key = pf.bottom_model_id
         LEFT JOIN leaderboard_metrics_agg lma ON lma.benchmark_id = b.benchmark_id
         LEFT JOIN leaderboard_rows_agg    lra ON lra.benchmark_id = b.benchmark_id
         LEFT JOIN instance_summary        ins ON ins.benchmark_id = b.benchmark_id
+        LEFT JOIN subtasks_agg            sub ON sub.benchmark_id = b.benchmark_id
         ORDER BY b.benchmark_id
         """
     )
@@ -2350,8 +2512,8 @@ def stage_j_emit_view_parquets(con, out_dir: Path, snapshot_id: str) -> None:
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     for table, sort_key in [
-        ("eval_results_view", "(metric_summary_id, model_id)"),
-        ("models_view",       "(model_id)"),
+        ("eval_results_view", "(metric_summary_id, model_key)"),
+        ("models_view",       "(model_key)"),
         ("evals_view",        "(evaluation_id)"),
     ]:
         path = out_dir / f"{table}.parquet"

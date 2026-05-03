@@ -88,7 +88,7 @@ def ensure_snapshot(local_dir: str, hf_token: str | None, force_refresh: bool) -
         local_dir=str(target),
         allow_patterns=["data/**"],
         ignore_patterns=[f"data/{cfg}/**" for cfg in IGNORED_CONFIGS],
-        max_workers=32,
+        max_workers=16,
         token=hf_token,
     )
     log.info("EEE snapshot ready at %s", target)
