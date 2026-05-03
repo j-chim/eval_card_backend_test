@@ -2,10 +2,17 @@
 
 Reads `HF_TARGET_DATASET` (e.g. `j-chim/temp_evalcard_backend`) and
 `HF_TOKEN` from env. Picks the most-recent snapshot under `warehouse/`
-and uploads it under `warehouse/<snapshot_id>/` on the dataset, matching
-the local layout so a deploy can pin via `SNAPSHOT_URL=.../warehouse/<id>`.
+and uploads it twice:
 
-Idempotent: re-running over an existing snapshot path no-ops.
+  - `warehouse/<snapshot_id>/` — immutable historical pin; consumers that
+    want reproducibility set `SNAPSHOT_URL=.../warehouse/<id>`.
+  - `warehouse/latest/` — mirror of the same snapshot, refreshed every
+    run, so the frontend can fetch from a stable URL without knowing the
+    snapshot ID. `delete_patterns="*"` makes the latest/ contents
+    replace rather than accumulate across runs.
+
+Idempotent: re-running over an existing snapshot path no-ops the
+timestamped upload; the latest/ upload always rewrites.
 """
 from __future__ import annotations
 
@@ -46,6 +53,16 @@ def main() -> int:
         commit_message=f"snapshot {latest.name}",
     )
     print(f"Uploaded {latest.name} → hf://{target}/warehouse/{latest.name}")
+
+    api.upload_folder(
+        folder_path=str(latest),
+        path_in_repo="warehouse/latest",
+        repo_id=target,
+        repo_type="dataset",
+        commit_message=f"refresh latest → {latest.name}",
+        delete_patterns="*",
+    )
+    print(f"Refreshed hf://{target}/warehouse/latest → {latest.name}")
     return 0
 
 
