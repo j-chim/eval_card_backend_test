@@ -12,7 +12,8 @@ build/
 .env
 
 # local development
-.claude/
-CLAUDE.md
-notes/
+#.claude/
+#CLAUDE.md
+#notes/
 notebooks/
+
