@@ -5,6 +5,10 @@ description = "Materializes evaluation artifacts from evaleval/EEE_datastore and
 requires-python = ">=3.11"
 dependencies = [
     "huggingface_hub>=0.24",
+    "duckdb>=1.0",
+    "pandas>=2",
+    "pyarrow>=16",
+    "eval-entity-resolver",
 ]
 
 [project.scripts]
@@ -17,10 +21,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/eval_card_backend"]
 
+[tool.uv.sources]
+eval-entity-resolver = { path = "../eval-card-registry/packages/eval-entity-resolver", editable = true }
+
 [dependency-groups]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
     "jupyterlab>=4",
-    "pandas>=2",
 ]
