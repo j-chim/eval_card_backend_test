@@ -5,6 +5,7 @@ Two on-disk shapes are supported:
     `benchmark_details` payload).
   - A flat `benchmark-metadata.json` mapping name -> card.
 """
+from __future__ import annotations
 
 import json
 import re

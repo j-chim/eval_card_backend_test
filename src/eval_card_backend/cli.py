@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -8,33 +10,45 @@ from eval_card_backend.sources import benchmark_cards, eee
 
 
 def _cmd_summary(args: argparse.Namespace) -> int:
+    """Inspect what's in the local cache without triggering downloads.
+
+    The bare `eval-card-backend` invocation is meant for "what's already
+    here?" — surfacing missing caches as `(not cached)` rather than
+    silently kicking off multi-GB HF fetches. The `canonicalise` subcommand
+    is the explicit fetch path.
+    """
+    from pathlib import Path
+
     settings = Settings.from_env()
 
-    eee_root = eee.ensure_snapshot(
-        settings.eee_local_dir, settings.hf_token, settings.refresh_eee
-    )
-    cards_root = benchmark_cards.ensure_snapshot(
-        settings.benchmark_metadata_local_dir,
-        settings.hf_token,
-        settings.refresh_benchmark_metadata,
-    )
+    eee_local = Path(settings.eee_local_dir).resolve()
+    cards_local = Path(settings.benchmark_metadata_local_dir).resolve()
+
+    eee_root: Path | None = eee_local if (eee_local / "data").exists() else None
+    cards_root: Path | None = cards_local if cards_local.exists() else None
 
     cards = benchmark_cards.load_cards(cards_root) if cards_root else {}
 
-    configs = eee.discover_configs(eee_root, settings.hf_token)
-    if args.configs:
-        wanted = {c.strip() for c in args.configs.split(",") if c.strip()}
-        configs = [c for c in configs if c in wanted]
-    if args.config_limit:
-        configs = configs[: args.config_limit]
+    if eee_root is None:
+        configs: list[str] = []
+    else:
+        configs = eee.discover_configs(eee_root, hf_token=None)
+        if args.configs:
+            wanted = {c.strip() for c in args.configs.split(",") if c.strip()}
+            configs = [c for c in configs if c in wanted]
+        if args.config_limit:
+            configs = configs[: args.config_limit]
 
     summary = {
-        "eee_root": str(eee_root),
-        "benchmark_cards_root": str(cards_root) if cards_root else None,
+        "eee_root": str(eee_root) if eee_root else "(not cached)",
+        "benchmark_cards_root": str(cards_root) if cards_root else "(not cached)",
         "benchmark_card_count": len(cards),
         "config_count": len(configs),
         "configs": [
-            {"name": c, "json_files": len(eee.list_json_files(c, eee_root, settings.hf_token))}
+            {
+                "name": c,
+                "json_files": len(eee.list_json_files(c, eee_root, hf_token=None)),
+            }
             for c in configs
         ],
     }
@@ -67,8 +81,18 @@ def _cmd_canonicalise(args: argparse.Namespace) -> int:
         warehouse_dir=args.warehouse,
         registry_local_dir=args.registry_local_dir,
         skip_preflight=args.skip_preflight,
+        cache_root=args.cache_root,
+        no_cache=args.no_cache,
+        from_stage=args.from_stage,
+        to_stage=args.to_stage,
     )
-    print(f"\nWrote snapshot to: {out_dir}")
+    if out_dir is None:
+        print(
+            f"\nStopped after stage {args.to_stage}; cache dir is the result "
+            f"(under {args.cache_root})."
+        )
+    else:
+        print(f"\nWrote snapshot to: {out_dir}")
     return 0
 
 
@@ -113,6 +137,28 @@ def main(argv: list[str] | None = None) -> int:
     canon.add_argument(
         "--skip-preflight", action="store_true",
         help="Skip preflight checks (use only for diagnostic runs).",
+    )
+    canon.add_argument(
+        "--cache-root", default=".cache/canonicalise",
+        help="Directory holding per-snapshot stage caches. Default: .cache/canonicalise",
+    )
+    canon.add_argument(
+        "--no-cache", action="store_true",
+        help="Skip writing stage caches (cache reads still work for --from-stage).",
+    )
+    canon.add_argument(
+        "--from-stage",
+        help="Resume from this stage letter (A,B,C,D,E,F,G,I,J); restores cached "
+             "outputs for earlier stages. If --snapshot-id is unset, uses the "
+             "latest snapshot under --cache-root. Stage J builds the view layer "
+             "(eval_results_view, models_view, evals_view) + writes the JSON "
+             "sidecars (manifest, headline, hierarchy).",
+    )
+    canon.add_argument(
+        "--to-stage",
+        help="Stop after this stage letter. Stops before warehouse emit if set "
+             "earlier than I; cache dir is the result. Set to J (default) to "
+             "produce the full view-layer warehouse.",
     )
 
     args = parser.parse_args(argv)

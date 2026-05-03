@@ -1,0 +1,79 @@
+name: Sync Pipeline
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/eval_card_backend/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/sync.yml"
+
+env:
+  # Target HF dataset for the published warehouse. Currently a scratch
+  # repo; flip to the production target when the schema is locked.
+  HF_TARGET_DATASET: j-chim/temp_evalcard_backend
+  # Pin the registry resolver source for reproducible CI builds. Bump
+  # when registry semantics change and we want CI to pick them up.
+  RESOLVER_REF: main
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Configure resolver dep for CI
+        run: python3 scripts/ci_install_resolver.py
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Cache HF dataset snapshots
+        uses: actions/cache@v4
+        with:
+          # Stage cache (.cache/canonicalise/) is intentionally NOT cached:
+          # production runs always mint fresh snapshot IDs and never invoke
+          # --from-stage on prior runs. Caching it would just accumulate
+          # stale snapshot dirs.
+          path: |
+            .cache/eee_datastore
+            .cache/auto_benchmarkcards
+            .cache/entity_registry
+          key: hf-snapshots-${{ github.run_id }}
+          restore-keys: |
+            hf-snapshots-
+
+      - name: Run tests
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run pytest tests/
+
+      - name: Run canonicalisation
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run eval-card-backend canonicalise --warehouse warehouse
+
+      - name: Publish warehouse snapshot to HF dataset
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TARGET_DATASET: ${{ env.HF_TARGET_DATASET }}
+        run: uv run python scripts/ci_publish_warehouse.py
+
+      - name: Upload snapshot_meta as run artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: snapshot-meta
+          path: warehouse/*/snapshot_meta.json
+          if-no-files-found: warn

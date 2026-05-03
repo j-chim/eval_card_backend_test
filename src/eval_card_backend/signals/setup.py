@@ -27,6 +27,10 @@ GENERATION_ARGS_COMPARISON_FIELDS: tuple[str, ...] = (
 )
 
 
+def _identity(v):
+    return v
+
+
 _LINE_ENDING_RE = re.compile(r"\r\n|\r")
 
 
@@ -117,6 +121,21 @@ def _norm_bool(v: Any) -> Any:
     return v
 
 
+# Per-field normalisers used by both normalize_setup and
+# differing_setup_fields, so the canonical-form dedup logic stays consistent
+# across call sites.
+_PER_FIELD_NORMALISERS: dict[str, Any] = {
+    "temperature": _norm_num,
+    "top_p": _norm_num,
+    "top_k": _norm_num,
+    "max_tokens": _norm_int,
+    "prompt_template": _norm_text,
+    "reasoning": _norm_bool,
+    # agentic_eval_config is normalised by canonical_json downstream when needed
+    "agentic_eval_config": _identity,
+}
+
+
 def normalize_setup(generation_args: Any) -> dict:
     """Normalised dict over the seven comparison fields. Always returns a dict
     with all seven keys; values may be None.
@@ -126,14 +145,8 @@ def normalize_setup(generation_args: Any) -> dict:
     ga = _coerce_json(generation_args, caller="normalize_setup")
     ga = ga if isinstance(ga, dict) else {}
     return {
-        "temperature": _norm_num(ga.get("temperature")),
-        "top_p": _norm_num(ga.get("top_p")),
-        "top_k": _norm_num(ga.get("top_k")),
-        "max_tokens": _norm_int(ga.get("max_tokens")),
-        "prompt_template": _norm_text(ga.get("prompt_template")),
-        "reasoning": _norm_bool(ga.get("reasoning")),
-        # agentic_eval_config goes through canonical_json downstream when needed
-        "agentic_eval_config": ga.get("agentic_eval_config"),
+        field: _PER_FIELD_NORMALISERS[field](ga.get(field))
+        for field in GENERATION_ARGS_COMPARISON_FIELDS
     }
 
 
@@ -150,43 +163,46 @@ def variant_key_py(generation_args: Any) -> str:
 def fact_id_py(evaluation_id: str | None, result_idx: int | None) -> str | None:
     """First 16 hex chars of sha256(f'{evaluation_id}:{result_idx}').
 
-    Matches the registry's `eval_results.id` formula. Returns None on missing
-    evaluation_id (we can't synthesise a deterministic id without one).
+    Matches the registry's `eval_results.id` formula. Returns None when
+    either input is missing — synthesising a default index would conflate
+    distinct rows under the same fact_id.
     """
-    if not evaluation_id:
+    if not evaluation_id or result_idx is None:
         return None
-    if result_idx is None:
-        result_idx = 0
     payload = f"{evaluation_id}:{result_idx}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def differing_setup_fields(setups: list[Any]) -> list[dict]:
-    """For each comparison field, if canonical-JSON values differ across `setups`,
-    record the field with the unique original values (first-seen order, deduped
-    by canonical form).
+def differing_setup_fields(generation_args_list: list[Any]) -> list[dict]:
+    """For each comparison field, find the distinct values across the given
+    raw generation_args dicts (deduped by their per-field-normalised canonical
+    form) and record the ORIGINAL pre-normalised values in first-seen order.
+
+    Preserving original values matters so a UI can render
+    `"max_tokens varies: 2048, 4096, 8192"` from raw, not from `.8g`-truncated
+    floats or whitespace-stripped prompt_templates.
 
     Used in both variant- and cross-party-divergence detection.
     """
     differing: list[dict] = []
     for field in GENERATION_ARGS_COMPARISON_FIELDS:
+        normaliser = _PER_FIELD_NORMALISERS[field]
         seen_canon: set[str] = set()
         original_values: list[Any] = []
-        for setup in setups:
-            value = setup.get(field) if isinstance(setup, dict) else None
-            canon = canonical_json(value) if value is not None else "null"
+        for ga in generation_args_list:
+            raw_value = ga.get(field) if isinstance(ga, dict) else None
+            normalised = normaliser(raw_value)
+            canon = canonical_json(normalised) if normalised is not None else "null"
             if canon not in seen_canon:
                 seen_canon.add(canon)
-                original_values.append(value)
+                original_values.append(raw_value)
         if len(seen_canon) > 1:
-            # Mirror DDL: STRUCT(field VARCHAR, "values" JSON)[]
-            # JSON-encode the original values for the "values" field.
-            differing.append(
-                {
-                    "field": field,
-                    "values": json.dumps(
-                        original_values, ensure_ascii=False, default=str
-                    ),
-                }
-            )
+            # DDL declares STRUCT(field VARCHAR, "values" JSON)[]. The
+            # JSON field must be a serialised JSON string for the Parquet
+            # COPY — DuckDB stringifies native Python lists in a
+            # non-JSON-parseable way during write.
+            differing.append({
+                "field": field,
+                "values": json.dumps(original_values, ensure_ascii=False, default=str),
+            })
     return differing

@@ -10,12 +10,20 @@ import re
 import statistics
 from typing import Any
 
+from eval_card_backend.canonicalise.thresholds import compute_threshold  # re-export
 from eval_card_backend.signals.setup import (
     _coerce_json,
-    canonical_json,
     differing_setup_fields,
-    normalize_setup,
 )
+
+
+__all__ = [
+    "aggregated_setup",
+    "compute_cross_party_divergence_py",
+    "compute_threshold",
+    "compute_variant_divergence_py",
+    "normalize_org_name",
+]
 
 
 _WHITESPACE_REGEX = re.compile(r"\s+")
@@ -39,31 +47,6 @@ def _display_org_name(name: Any) -> str | None:
         return None
     cleaned = _WHITESPACE_REGEX.sub(" ", name).strip()
     return cleaned or None
-
-
-def compute_threshold(metric_config: Any) -> tuple[float, str]:
-    """Return (threshold, basis_label). Basis is one of four labels — see notes/01-.
-
-    Inputs come from the registry's `canonical_metrics`. Per-record metric_config
-    fields are not consulted (legacy used them; the new design centralises in
-    the registry to avoid per-record drift).
-    """
-    if isinstance(metric_config, dict):
-        metric_unit = metric_config.get("metric_unit")
-        metric_kind = metric_config.get("metric_kind")
-        if metric_unit == "proportion" or metric_kind == "continuous_normalized":
-            return 0.05, "proportion_or_continuous_normalized"
-        if metric_unit == "percent":
-            return 5.0, "percent"
-        min_score = metric_config.get("min_score")
-        max_score = metric_config.get("max_score")
-        if (
-            _is_real_number(min_score)
-            and _is_real_number(max_score)
-            and max_score > min_score
-        ):
-            return 0.05 * (max_score - min_score), "range_5pct"
-    return 0.05, "fallback_default"
 
 
 def aggregated_setup(rows_for_org: list[dict]) -> dict | None:
@@ -95,7 +78,11 @@ def _coerce_rows_gen_args(rows: list[dict], caller: str) -> None:
 def compute_variant_divergence_py(
     rows: list[dict], metric_config: Any
 ) -> dict | None:
-    """Spec §6.1 + legacy. Returns None when not applicable.
+    """Detect score divergence across rows in a (model, benchmark, metric)
+    group that share generation setup keys but differ on at least one
+    setup field. Returns None when not applicable (fewer than 2 rows, no
+    differing setup fields, or fewer than 2 rows with real scores) so the
+    frontend can distinguish N/A from "applicable & no divergence".
 
     Each row dict carries: fact_id, evaluation_id, score, generation_args
     (str | dict), evaluator_relationship, source_organization_name.
@@ -105,8 +92,7 @@ def compute_variant_divergence_py(
     if len(rows) < 2:
         return None
 
-    setups = [normalize_setup(r.get("generation_args")) for r in rows]
-    diffs = differing_setup_fields(setups)
+    diffs = differing_setup_fields([r.get("generation_args") for r in rows])
     if not diffs:
         return None
 
@@ -130,11 +116,15 @@ def compute_variant_divergence_py(
 def compute_cross_party_divergence_py(
     rows: list[dict], metric_config: Any
 ) -> dict | None:
-    """Spec §6.2 + legacy. Returns None when fewer than 2 distinct named orgs.
+    """Detect score divergence across distinct reporting organisations for
+    one (model, benchmark, metric) group. Returns None when fewer than 2
+    distinct named orgs report — the signal isn't applicable, and the
+    NULL distinguishes it from "applicable & no divergence".
 
-    Per-org score is the median of the org's scored rows; per-org representative
-    setup is `aggregated_setup` of those rows (lower-median). differing_setup_fields
-    is computed across org-representative setups (not across all rows).
+    Per-org score is the median of the org's scored rows; per-org
+    representative setup is `aggregated_setup` of those rows (lower-median
+    rule). differing_setup_fields is computed across org-representative
+    setups, not across all rows.
     """
     _coerce_rows_gen_args(rows, "compute_cross_party_divergence_py.gen_args")
 
@@ -164,10 +154,7 @@ def compute_cross_party_divergence_py(
     divergence = max(org_scores.values()) - min(org_scores.values())
     threshold, basis = compute_threshold(metric_config)
 
-    setups_for_diff = [
-        normalize_setup(s) for s in org_setups.values()
-    ]
-    diffs = differing_setup_fields(setups_for_diff)
+    diffs = differing_setup_fields(list(org_setups.values()))
 
     scores_by_org = {
         org_display[normalized]: score for normalized, score in org_scores.items()

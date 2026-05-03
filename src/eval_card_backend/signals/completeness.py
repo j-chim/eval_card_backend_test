@@ -1,18 +1,11 @@
-"""Per-benchmark reporting completeness, scored against the operationalised
-28-field set (see `registry/completeness_fields.json`).
+"""Per-fact-row reporting completeness, scored against the operationalised
+28-field set in `registry/completeness_fields.json`.
 
-Inputs:
-  - the benchmark card payload (the AutoBenchmarkCards record, or None when
-    no card is present).
-
-The signal also wants `eee_eval.source_metadata.*` fields scored — but those
-are per-row, not per-benchmark. Operationally we score them against the
-benchmark card alone (the per-row source_metadata flows through `fact_results`
-columns separately). The 28-field set still references them so the score's
-denominator stays at 28 — they simply contribute 0 unless the per-benchmark
-materialisation is later extended to include them. Reserved EvalCards fields
-(`lifecycle_status`, `preregistration_url`) are scored 0 today (registry
-doesn't carry them); they count toward the denominator per spec §4.2.
+The signal is per-fact-row (not per-benchmark): 3 of the 28 fields are EEE
+source_metadata that describe the report, not the benchmark, and so vary
+across reports of the same benchmark. The remaining 25 are benchmark-level
+constants (card + reserved EvalCards fields) that repeat identically
+across rows for a given benchmark — an accepted denormalisation cost.
 """
 from __future__ import annotations
 
@@ -45,25 +38,61 @@ def _resolve_path(record: Any, path: str) -> Any:
     return current
 
 
-def _build_record(card: Any) -> dict:
-    """Joined-record shape per legacy `compute_reporting_completeness`. The
-    `eee_eval.source_metadata.*` fields are scored 0 here (per-row data flows
-    via fact_results, not via this per-benchmark dim — see module docstring).
+def _build_record(
+    card: Any,
+    source_type: str | None,
+    source_organization_name: str | None,
+    evaluator_relationship: str | None,
+    lifecycle_status: str | None,
+    preregistration_url: str | None,
+) -> dict:
+    """Assemble the joined record the field-set paths resolve against.
+
+    Each top-level key matches the field-set path prefix:
+      - `autobenchmarkcard.*` paths read from the card.
+      - `eee_eval.source_metadata.*` paths read from the per-row source_metadata.
+      - `evalcards.*` paths read from the per-row reserved fields.
     """
     return {
         "autobenchmarkcard": card if isinstance(card, dict) else {},
-        "eee_eval": {"source_metadata": {}},
-        "evalcards": {},
+        "eee_eval": {
+            "source_metadata": {
+                "source_type": source_type,
+                "source_organization_name": source_organization_name,
+                "evaluator_relationship": evaluator_relationship,
+            }
+        },
+        "evalcards": {
+            "lifecycle_status": lifecycle_status,
+            "preregistration_url": preregistration_url,
+        },
     }
 
 
-def compute_completeness_py(card: Any) -> dict:
-    """Score the 28-field operationalised completeness set against `card`.
+def compute_completeness_py(
+    card: Any,
+    source_type: str | None = None,
+    source_organization_name: str | None = None,
+    evaluator_relationship: str | None = None,
+    lifecycle_status: str | None = None,
+    preregistration_url: str | None = None,
+) -> dict:
+    """Score the 28-field operationalised completeness set against a fact row.
 
-    Returns a dict matching `benchmark_completeness.parquet` column shape.
+    Inputs are the per-row data: the benchmark card (constant per benchmark)
+    plus the row's source_metadata fields and the two reserved evalcards
+    fields (currently always NULL). Returns a dict shaped to the per-row
+    completeness columns on `fact_results`.
     """
     parsed = _coerce_json(card, caller="compute_completeness_py")
-    record = _build_record(parsed)
+    record = _build_record(
+        parsed,
+        source_type,
+        source_organization_name,
+        evaluator_relationship,
+        lifecycle_status,
+        preregistration_url,
+    )
 
     field_scores: list[dict] = []
     partial_fields: list[dict] = []
@@ -115,5 +144,4 @@ def compute_completeness_py(card: Any) -> dict:
         "populated_count": populated_count,
         "missing_required_fields": missing_required_fields,
         "partial_fields": partial_fields,
-        "field_scores": field_scores,
     }

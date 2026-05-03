@@ -26,7 +26,7 @@ from huggingface_hub import snapshot_download
 
 log = logging.getLogger(__name__)
 
-ENTITY_REGISTRY_DATASET_REPO = "evaleval/entity-registry-data"
+from eval_card_backend.config import ENTITY_REGISTRY_DATASET_REPO
 
 DIM_TABLES: tuple[str, ...] = (
     "canonical_orgs",
@@ -74,18 +74,26 @@ def ensure_snapshot(
 
 
 def _resolve_table_path(root: Path, table: str) -> Path | None:
-    """Return the parquet path for `table`, supporting either a single-file
-    layout (`<table>.parquet`) or HF's directory layout (`<table>/part-*.parquet`).
+    """Return either the parquet file (single-file layout
+    `<table>.parquet`) or the containing directory (HF parts layout
+    `<table>/part-*.parquet`). Callers that pass the result to DuckDB's
+    `read_parquet` should run it through `read_parquet_arg` so dirs
+    become `<dir>/*.parquet` globs.
     """
     direct = root / f"{table}.parquet"
     if direct.exists():
         return direct
     table_dir = root / table
-    if table_dir.is_dir():
-        parts = sorted(table_dir.glob("*.parquet"))
-        if parts:
-            return parts[0] if len(parts) == 1 else table_dir
+    if table_dir.is_dir() and any(table_dir.glob("*.parquet")):
+        return table_dir
     return None
+
+
+def read_parquet_arg(path: Path) -> str:
+    """Convert a `_resolve_table_path` result into a DuckDB-readable
+    parquet argument — file path or directory glob.
+    """
+    return str(path / "*.parquet") if path.is_dir() else str(path)
 
 
 def open_dim_paths(root: Path) -> dict[str, Path]:

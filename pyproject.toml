@@ -6,9 +6,11 @@ requires-python = ">=3.11"
 dependencies = [
     "huggingface_hub>=0.24",
     "duckdb>=1.0",
-    "pandas>=2",
     "pyarrow>=16",
     "eval-entity-resolver",
+    # pydantic 2.5+ for Discriminator support, used by vendored eee_types.py
+    # (validates EEE records at the Stage A boundary).
+    "pydantic>=2.5",
 ]
 
 [project.scripts]
@@ -29,4 +31,7 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "jupyterlab>=4",
+    # pandas is dev-only (e2e fixtures + ad-hoc inspection); not in the hot
+    # path. See notes/02-:25 ("no Pandas in the hot path").
+    "pandas>=2",
 ]

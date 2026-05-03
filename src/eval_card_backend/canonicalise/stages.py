@@ -1,20 +1,19 @@
 """DuckDB stages for canonicalisation. SQL-heavy; orchestrated by `pipeline.run`.
 
-Each `stage_*` function takes a DuckDB connection (and any extra inputs it
-needs) and creates one or more tables on the connection. Tables are wired by
-name across stages — see the doc/notes/02-producer-shape.md for the data flow.
+Each `stage_*` function takes a DuckDB connection and creates one or more
+tables on the connection. Tables are wired by name across stages.
 
-Implementation notes (non-spec):
-- EEE records are loaded via a producer-side temp JSONL pre-staging (Python
-  iterates `loaders.iter_config_results`, dumps each raw record once, with the
-  `source_config` already attached). Lets us subset to a few configs easily and
-  sidesteps DuckDB filesystem-glob fragility on schema drift.
-- Cards are also pre-staged into a JSONL (matches the spec's approach).
-- The registry's `canonical_metrics` table doesn't carry `metric_kind`/
-  `metric_unit` columns yet; we project NULL for them at load. The legacy
-  fact_results columns (`metric_kind`, `metric_unit`) thus default to NULL until
-  the registry adds them. Threshold computation falls through to
-  `range_5pct`/`fallback_default`.
+Implementation notes:
+- EEE records arrive as a typed `pyarrow.Table` from `sources.eee.load_arrow_table`,
+  validated against the vendored upstream contract. Stage A registers the
+  Arrow table directly with DuckDB (zero-copy) under `eee_raw` — no temp JSONL,
+  no schema drift between configs.
+- Cards are pre-staged from a Python dict via a temp JSONL.
+- `metric_kind` / `metric_unit` / `min_score` / `max_score` / `lower_is_better`
+  on each fact row come from the metric-meta resolver UDF, not directly from
+  `canonical_metrics` (which is sparse for those fields). Stage A loads the
+  registry columns; Stage D's `joined` CTE invokes the UDF once per row,
+  and the outer SELECT destructures `_meta.*` into flat columns.
 """
 from __future__ import annotations
 
@@ -22,68 +21,144 @@ import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import NamedTuple
+
+import pyarrow as pa
+
+from eval_card_backend.signals.reproducibility import (
+    AGENTIC_REPRODUCIBILITY_FIELDS,
+    BASE_REPRODUCIBILITY_FIELDS,
+)
+from eval_card_backend.sources.registry import read_parquet_arg
+
+
+def _build_repro_missing_fields_sql() -> str:
+    """Concatenated array-literal expression for `repro_missing_fields`.
+
+    Mirrors the active rule in `signals/reproducibility.py`. Base fields
+    fire unconditionally on missing; agentic fields fire only when
+    `is_agentic`. Same field names are also used as `has_<field>` flag
+    columns in the upstream `base` CTE — keep the two in sync.
+    """
+    base_clauses = [
+        f"(CASE WHEN NOT has_{f} THEN ['{f}'] ELSE []::VARCHAR[] END)"
+        for f in BASE_REPRODUCIBILITY_FIELDS
+    ]
+    agentic_clauses = [
+        f"(CASE WHEN is_agentic AND NOT has_{f} THEN ['{f}'] ELSE []::VARCHAR[] END)"
+        for f in AGENTIC_REPRODUCIBILITY_FIELDS
+    ]
+    return "\n                 || ".join(base_clauses + agentic_clauses)
+
+
+_REPRO_MISSING_FIELDS_SQL = _build_repro_missing_fields_sql()
+_REPRO_BASE_COUNT = len(BASE_REPRODUCIBILITY_FIELDS)
+_REPRO_AGENTIC_COUNT = _REPRO_BASE_COUNT + len(AGENTIC_REPRODUCIBILITY_FIELDS)
+
+
+# Stage J view-layer signal-summary STRUCT shapes. Identical across
+# `models_view` and `evals_view`; declared here so a shape change is a
+# one-line edit.
+_REPRODUCIBILITY_SUMMARY_STRUCT = (
+    "STRUCT("
+    "results_total INTEGER, "
+    "has_reproducibility_gap_count INTEGER, "
+    "populated_ratio_avg DOUBLE"
+    ")"
+)
+_PROVENANCE_SUMMARY_STRUCT = (
+    "STRUCT("
+    "total_results INTEGER, total_groups INTEGER, "
+    "multi_source_groups INTEGER, first_party_only_groups INTEGER, "
+    "source_type_distribution STRUCT("
+    "  first_party INTEGER, third_party INTEGER, "
+    "  collaborative INTEGER, unspecified INTEGER"
+    ")"
+    ")"
+)
+_COMPARABILITY_SUMMARY_STRUCT = (
+    "STRUCT("
+    "total_groups INTEGER, "
+    "groups_with_variant_check INTEGER, "
+    "groups_with_cross_party_check INTEGER, "
+    "variant_divergent_count INTEGER, "
+    "cross_party_divergent_count INTEGER"
+    ")"
+)
+
+
+def _source_type_distribution_sql(alias: str) -> str:
+    """Emit four SQL aggregate columns for the
+    `source_type_distribution` four-way breakdown derived from
+    `coverage_cell` + `has_third_party`. Caller must reference the
+    output names `pst_first_party`, `pst_third_party`,
+    `pst_collaborative`, `pst_unspecified`.
+    """
+    a = alias
+    return (
+        f"CAST(SUM(CASE WHEN {a}.coverage_cell = 'self'                              THEN 1 ELSE 0 END) AS INTEGER) AS pst_first_party,\n"
+        f"                CAST(SUM(CASE WHEN {a}.coverage_cell = 'third' AND {a}.has_third_party     THEN 1 ELSE 0 END) AS INTEGER) AS pst_third_party,\n"
+        f"                CAST(SUM(CASE WHEN {a}.coverage_cell = 'both'                              THEN 1 ELSE 0 END) AS INTEGER) AS pst_collaborative,\n"
+        f"                CAST(SUM(CASE WHEN {a}.coverage_cell = 'third' AND NOT {a}.has_third_party THEN 1 ELSE 0 END) AS INTEGER) AS pst_unspecified"
+    )
+
+
+def org_normalize_sql(column_expr: str) -> str:
+    r"""Return the SQL expression that lowercases, collapses ASCII
+    whitespace runs, trims, and NULLs out the empty string. Mirrors
+    `signals/comparability.normalize_org_name` for the same input shape;
+    parity is asserted in `tests/test_udf_roundtrip.py`. Use this helper
+    everywhere instead of inlining the regex so the two paths stay in
+    sync.
+
+    The regex is ASCII-only (`\s` in DuckDB / RE2). Unicode whitespace
+    (e.g. NBSP) is left intact in the SQL path; Python's `re.sub` would
+    collapse it. Production data has not exhibited this divergence.
+    """
+    return (
+        f"NULLIF(trim(regexp_replace(lower({column_expr}), '\\s+', ' ', 'g')), '')"
+    )
+
+
+class StageEStats(NamedTuple):
+    """Row-count breakdown for Stage E. Exposed so the orchestrator can
+    populate snapshot_meta with each drop reason separately."""
+    pre: int                    # rows in fact_results_staging
+    n_dropped_no_score: int     # score IS NULL
+    n_dropped_sentinel: int     # score = -1 sentinel
+    n_dropped_dedup: int        # fact_id collisions
+    post: int                   # final fact_results_signaled count
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Stage A — raw load
+# Stage A drop tracking. The actual counter lives in `sources.eee` (where the
+# loader writes to it); these names exist as backward-compat shims for the
+# pipeline orchestrator + Stage A test fixtures that pre-date the move.
 # ---------------------------------------------------------------------------
 
 
-def stage_a_load_eee_jsonl(con, eee_root: Path, configs: Iterable[str], hf_token: str | None) -> int:
-    """Stage EEE records to a temp JSONL (one record per line), then load into
-    `eee_raw` via `read_json_auto`. Returns the row count.
+# ---------------------------------------------------------------------------
+# Stage A — typed load via pyarrow
+# ---------------------------------------------------------------------------
 
-    `source_config` is attached to each record so downstream stages don't have
-    to extract it from the on-disk path.
+
+def stage_a_load_eee(con, arrow_table: pa.Table) -> int:
+    """Register a typed EEE Arrow table with DuckDB as `eee_raw`.
+
+    Zero-copy: DuckDB reads from the Arrow buffers in place. The caller
+    (`pipeline.run`) builds the table via `sources.eee.load_arrow_table`,
+    which validates each record against the vendored upstream Pydantic
+    models and casts to the schema derived from the JSON Schema.
     """
-    from eval_card_backend.sources import eee
-
-    tmp = tempfile.NamedTemporaryFile(
-        "w", suffix=".jsonl", delete=False, encoding="utf-8"
-    )
-    n = 0
-    with tmp:
-        for cfg in configs:
-            for path in eee.list_json_files(cfg, eee_root, hf_token):
-                try:
-                    record = eee.read_record(path, eee_root, hf_token)
-                except Exception as exc:
-                    log.warning("stage A: failed to read %s: %s", path, exc)
-                    continue
-                if not isinstance(record, dict):
-                    continue
-                record["source_config"] = cfg
-                record["_record_path"] = path
-                # Compact serialisation keeps DuckDB inference happy on
-                # multi-MB nested objects without forcing pretty-print
-                # whitespace through the parser.
-                tmp.write(json.dumps(record, ensure_ascii=False, default=str))
-                tmp.write("\n")
-                n += 1
-
-    if n == 0:
-        # Create an empty `eee_raw` table so downstream stages don't error.
-        con.execute("CREATE TABLE eee_raw AS SELECT NULL WHERE 0=1")
-        return 0
-
-    con.execute(
-        f"""
-        CREATE TABLE eee_raw AS
-        SELECT * FROM read_json_auto(
-            '{tmp.name}',
-            format = 'newline_delimited',
-            union_by_name = true,
-            maximum_object_size = 268435456
-        )
-        """
-    )
-    return n
+    con.register("eee_raw_arrow", arrow_table)
+    con.execute("CREATE TABLE eee_raw AS SELECT * FROM eee_raw_arrow")
+    con.unregister("eee_raw_arrow")
+    return arrow_table.num_rows
 
 
-def stage_a_load_cards(con, cards: dict, has_resolver_for_cards: bool = True) -> int:
+def stage_a_load_cards(con, cards: dict) -> int:
     """Stage AutoBenchmarkCards into `cards_raw_in`, then resolve card keys to
     canonical benchmark_ids into `cards_raw`.
     """
@@ -112,35 +187,22 @@ def stage_a_load_cards(con, cards: dict, has_resolver_for_cards: bool = True) ->
         """
     )
 
-    if has_resolver_for_cards:
-        con.execute(
-            """
-            CREATE TABLE cards_resolved AS
-            SELECT
-                card_key,
-                card,
-                resolve_canonical_id(card_key, 'benchmark', NULL) AS benchmark_id,
-                resolve_strategy(card_key, 'benchmark', NULL)     AS card_resolution_strategy
-            FROM cards_raw_in
-            WHERE card_key IS NOT NULL
-            """
-        )
-    else:
-        con.execute(
-            """
-            CREATE TABLE cards_resolved AS
-            SELECT card_key, card,
-                   CAST(NULL AS VARCHAR) AS benchmark_id,
-                   'no_match' AS card_resolution_strategy
-            FROM cards_raw_in
-            WHERE card_key IS NOT NULL
-            """
-        )
+    con.execute(
+        """
+        CREATE TABLE cards_resolved AS
+        SELECT
+            card_key,
+            card,
+            resolve_canonical_id(card_key, 'benchmark', NULL) AS benchmark_id,
+            resolve_strategy(card_key, 'benchmark', NULL)     AS card_resolution_strategy
+        FROM cards_raw_in
+        WHERE card_key IS NOT NULL
+        """
+    )
 
     # Dedupe per benchmark_id — multiple card_keys can resolve to the same
     # canonical benchmark (e.g. dataset alias and registered name). Without
-    # dedup the LEFT JOIN at Stage D / G fans out fact rows and breaks Stage H's
-    # scalar-subquery UPDATE for card_missing_count.
+    # dedup the LEFT JOIN at Stage D / G fans out fact rows.
     # First-seen-by-card_key wins (deterministic via ORDER BY card_key).
     con.execute(
         """
@@ -167,211 +229,160 @@ def stage_a_load_cards(con, cards: dict, has_resolver_for_cards: bool = True) ->
         """
     )
 
+    # Surface the collision count so the operator knows when two card files
+    # are competing for the same canonical benchmark (one wins, one is dropped
+    # silently from JOINs). Aggregate; per-pair detail available via the
+    # `cards_resolved` table for ad-hoc inspection.
+    collisions = con.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT benchmark_id, COUNT(*) AS n
+            FROM cards_resolved
+            WHERE benchmark_id IS NOT NULL
+            GROUP BY benchmark_id
+            HAVING n > 1
+        )
+        """
+    ).fetchone()[0]
+    if collisions:
+        log.warning(
+            "Stage A: %d benchmark_id(s) had multiple cards resolve to them; "
+            "first-by-card_key wins. Inspect cards_resolved for detail.",
+            collisions,
+        )
+
     return con.execute("SELECT count(*) FROM cards_raw").fetchone()[0]
 
 
-def _read_parquet_path(path: Path) -> str:
-    if path.is_dir():
-        return str(path / "*.parquet")
-    return str(path)
-
-
 def _table_columns(con, table_path: Path) -> set[str]:
-    path = _read_parquet_path(table_path)
+    path = read_parquet_arg(table_path)
     rows = con.execute(
         f"SELECT column_name FROM (DESCRIBE SELECT * FROM read_parquet('{path}'))"
     ).fetchall()
     return {r[0] for r in rows}
 
 
+_DIM_SCHEMAS: dict[str, list[tuple[str, str]]] = {
+    # canonical_orgs
+    "canonical_orgs": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("parent_org_id", "VARCHAR"),
+        ("website", "VARCHAR"),
+        ("hf_org", "VARCHAR"),
+        ("kind", "VARCHAR"),
+        ("tags", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+    # canonical_models — mirrors the registry's `canonical_models` table.
+    # Lineage is encoded as a typed `parents` JSON list (see decode_parents
+    # in eval_entity_resolver.canonical_store) plus scalar `root_model_id`
+    # / `lineage_origin_org_id`. Stage A derives `parent_model_id` from
+    # the first `variant` edge so downstream SQL keeps a flat scalar.
+    "canonical_models": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("developer", "VARCHAR"),
+        ("org_id", "VARCHAR"),
+        ("family", "VARCHAR"),
+        ("architecture", "VARCHAR"),
+        ("params_billions", "DOUBLE"),
+        ("parents", "VARCHAR"),
+        ("root_model_id", "VARCHAR"),
+        ("lineage_origin_org_id", "VARCHAR"),
+        ("open_weights", "BOOLEAN"),
+        ("release_date", "VARCHAR"),
+        ("tags", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+    # canonical_benchmarks
+    "canonical_benchmarks": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("description", "VARCHAR"),
+        ("dataset_repo", "VARCHAR"),
+        ("parent_benchmark_id", "VARCHAR"),
+        ("tags", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+    # canonical_metrics — registry has score_type/lower_is_better/min/max
+    # today; metric_kind / metric_unit are forward-looking. score_type stays
+    # as-is (binary/continuous/levels), distinct from metric_kind
+    # (accuracy/f1/elo/...). The hotfix UDF synthesises metric_kind /
+    # metric_unit per row via a layered chain.
+    "canonical_metrics": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("metric_kind", "VARCHAR"),
+        ("metric_unit", "VARCHAR"),
+        ("score_type", "VARCHAR"),
+        ("lower_is_better", "BOOLEAN"),
+        ("min_score", "DOUBLE"),
+        ("max_score", "DOUBLE"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+    # eval_harnesses
+    "eval_harnesses": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("version", "VARCHAR"),
+        ("fork_url", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+}
+
+
+def _load_dim(con, name: str, dim_paths: dict) -> None:
+    """Load one registry dim table to its spec shape, padding missing
+    columns with typed NULLs. When the registry doesn't carry the dim at
+    all, create an empty table with the same schema so downstream stages
+    can JOIN unconditionally.
+
+    CASTs each present column to the spec'd type so all-NULL columns
+    don't poison downstream type inference. Without the cast, an upstream
+    parquet with a column of all NULLs lands as INTEGER, then any
+    `COALESCE(dim.col, varchar_col)` downstream binds against the wrong
+    type.
+    """
+    schema = _DIM_SCHEMAS[name]
+    if name not in dim_paths:
+        ddl = ", ".join(f"{c} {t}" for c, t in schema)
+        con.execute(f"CREATE TABLE {name} ({ddl})")
+        return
+    path = read_parquet_arg(dim_paths[name])
+    present = _table_columns(con, dim_paths[name])
+    select_parts = [
+        f"CAST({col} AS {ddl}) AS {col}" if col in present
+        else f"CAST(NULL AS {ddl}) AS {col}"
+        for col, ddl in schema
+    ]
+    con.execute(
+        f"CREATE TABLE {name} AS SELECT {', '.join(select_parts)} "
+        f"FROM read_parquet('{path}')"
+    )
+
+
 def stage_a_load_registry(con, dim_paths: dict) -> None:
     """Load registry dim tables. Aliases each dim's columns to the spec shape;
     where the registry doesn't carry a column yet, project NULL.
+
+    Also derives `canonical_models.parent_model_id` from the typed
+    `parents` JSON list — the registry switched from a scalar
+    `parent_model_id` column to a list of typed edges, and downstream
+    SQL still wants the flat scalar.
     """
-    # canonical_orgs
-    if "canonical_orgs" in dim_paths:
-        path = _read_parquet_path(dim_paths["canonical_orgs"])
-        cols = _table_columns(con, dim_paths["canonical_orgs"])
-        # Ensure all columns the spec references exist as NULLs when missing.
-        select_parts = []
-        for col, ddl in [
-            ("id", "VARCHAR"),
-            ("display_name", "VARCHAR"),
-            ("parent_org_id", "VARCHAR"),
-            ("website", "VARCHAR"),
-            ("hf_org", "VARCHAR"),
-            ("tags", "VARCHAR"),
-            ("metadata", "VARCHAR"),
-            ("review_status", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        con.execute(
-            f"CREATE TABLE canonical_orgs AS SELECT {', '.join(select_parts)} "
-            f"FROM read_parquet('{path}')"
-        )
-    else:
-        con.execute(
-            "CREATE TABLE canonical_orgs (id VARCHAR, display_name VARCHAR, "
-            "parent_org_id VARCHAR, website VARCHAR, hf_org VARCHAR, tags VARCHAR, "
-            "metadata VARCHAR, review_status VARCHAR)"
-        )
+    for name in _DIM_SCHEMAS:
+        _load_dim(con, name, dim_paths)
 
-    # canonical_models
-    if "canonical_models" in dim_paths:
-        path = _read_parquet_path(dim_paths["canonical_models"])
-        cols = _table_columns(con, dim_paths["canonical_models"])
-        select_parts = []
-        for col, ddl in [
-            ("id", "VARCHAR"),
-            ("display_name", "VARCHAR"),
-            ("developer", "VARCHAR"),
-            ("org_id", "VARCHAR"),
-            ("family", "VARCHAR"),
-            ("architecture", "VARCHAR"),
-            ("params_billions", "DOUBLE"),
-            ("parent_model_id", "VARCHAR"),
-            ("tags", "VARCHAR"),
-            ("metadata", "VARCHAR"),
-            ("review_status", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        # Roadmap fields (released, license, modality, access, context_tokens,
-        # context_label) are projected from the registry when present, else NULL.
-        for col, ddl in [
-            ("released", "DATE"),
-            ("license", "VARCHAR"),
-            ("modality", "VARCHAR[]"),
-            ("access", "VARCHAR"),
-            ("context_tokens", "INTEGER"),
-            ("context_label", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        con.execute(
-            f"CREATE TABLE canonical_models AS SELECT {', '.join(select_parts)} "
-            f"FROM read_parquet('{path}')"
-        )
-    else:
-        con.execute(
-            "CREATE TABLE canonical_models (id VARCHAR, display_name VARCHAR, "
-            "developer VARCHAR, org_id VARCHAR, family VARCHAR, architecture VARCHAR, "
-            "params_billions DOUBLE, parent_model_id VARCHAR, tags VARCHAR, "
-            "metadata VARCHAR, review_status VARCHAR, "
-            "released DATE, license VARCHAR, modality VARCHAR[], "
-            "access VARCHAR, context_tokens INTEGER, context_label VARCHAR)"
-        )
-
-    # canonical_benchmarks
-    if "canonical_benchmarks" in dim_paths:
-        path = _read_parquet_path(dim_paths["canonical_benchmarks"])
-        cols = _table_columns(con, dim_paths["canonical_benchmarks"])
-        select_parts = []
-        for col, ddl in [
-            ("id", "VARCHAR"),
-            ("display_name", "VARCHAR"),
-            ("description", "VARCHAR"),
-            ("dataset_repo", "VARCHAR"),
-            ("parent_benchmark_id", "VARCHAR"),
-            ("tags", "VARCHAR"),
-            ("metadata", "VARCHAR"),
-            ("review_status", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        con.execute(
-            f"CREATE TABLE canonical_benchmarks AS SELECT {', '.join(select_parts)} "
-            f"FROM read_parquet('{path}')"
-        )
-    else:
-        con.execute(
-            "CREATE TABLE canonical_benchmarks (id VARCHAR, display_name VARCHAR, "
-            "description VARCHAR, dataset_repo VARCHAR, parent_benchmark_id VARCHAR, "
-            "tags VARCHAR, metadata VARCHAR, review_status VARCHAR)"
-        )
-
-    # canonical_metrics — registry has `score_type` but spec wants
-    # `metric_kind` / `metric_unit`. Map score_type → metric_kind; metric_unit
-    # NULL until the registry adds it.
-    if "canonical_metrics" in dim_paths:
-        path = _read_parquet_path(dim_paths["canonical_metrics"])
-        cols = _table_columns(con, dim_paths["canonical_metrics"])
-        select_parts = ["id"]
-        # display_name
-        select_parts.append(
-            "display_name" if "display_name" in cols
-            else "CAST(NULL AS VARCHAR) AS display_name"
-        )
-        # metric_kind: prefer existing metric_kind, fall back to score_type
-        if "metric_kind" in cols:
-            select_parts.append("metric_kind")
-        elif "score_type" in cols:
-            select_parts.append("score_type AS metric_kind")
-        else:
-            select_parts.append("CAST(NULL AS VARCHAR) AS metric_kind")
-        # metric_unit
-        select_parts.append(
-            "metric_unit" if "metric_unit" in cols
-            else "CAST(NULL AS VARCHAR) AS metric_unit"
-        )
-        for col, ddl in [
-            ("lower_is_better", "BOOLEAN"),
-            ("min_score", "DOUBLE"),
-            ("max_score", "DOUBLE"),
-            ("metadata", "VARCHAR"),
-            ("review_status", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        con.execute(
-            f"CREATE TABLE canonical_metrics AS SELECT {', '.join(select_parts)} "
-            f"FROM read_parquet('{path}')"
-        )
-    else:
-        con.execute(
-            "CREATE TABLE canonical_metrics (id VARCHAR, display_name VARCHAR, "
-            "metric_kind VARCHAR, metric_unit VARCHAR, "
-            "lower_is_better BOOLEAN, min_score DOUBLE, max_score DOUBLE, "
-            "metadata VARCHAR, review_status VARCHAR)"
-        )
-
-    # eval_harnesses
-    if "eval_harnesses" in dim_paths:
-        path = _read_parquet_path(dim_paths["eval_harnesses"])
-        cols = _table_columns(con, dim_paths["eval_harnesses"])
-        select_parts = []
-        for col, ddl in [
-            ("id", "VARCHAR"),
-            ("display_name", "VARCHAR"),
-            ("version", "VARCHAR"),
-            ("fork_url", "VARCHAR"),
-            ("metadata", "VARCHAR"),
-            ("review_status", "VARCHAR"),
-        ]:
-            if col in cols:
-                select_parts.append(col)
-            else:
-                select_parts.append(f"CAST(NULL AS {ddl}) AS {col}")
-        con.execute(
-            f"CREATE TABLE eval_harnesses AS SELECT {', '.join(select_parts)} "
-            f"FROM read_parquet('{path}')"
-        )
-    else:
-        con.execute(
-            "CREATE TABLE eval_harnesses (id VARCHAR, display_name VARCHAR, "
-            "version VARCHAR, fork_url VARCHAR, metadata VARCHAR, review_status VARCHAR)"
-        )
+    con.execute("ALTER TABLE canonical_models ADD COLUMN parent_model_id VARCHAR")
+    con.execute(
+        "UPDATE canonical_models SET parent_model_id = variant_parent_id_udf(parents)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -387,15 +398,13 @@ def _eee_raw_columns(con) -> set[str]:
     return {r[0] for r in rows}
 
 
-def _maybe_col(eee_cols: set[str], col: str, ddl: str) -> str:
-    """Project `e.<col>` if present, else `CAST(NULL AS <ddl>) AS col`."""
-    if col in eee_cols:
-        return f"e.{col}"
-    return f"CAST(NULL AS {ddl}) AS {col}"
+def stage_b_explode_evaluation_results(con) -> int:
+    """One row per (evaluation, result_idx). result_idx is 0-based to match the registry.
 
-
-def stage_b_explode(con) -> int:
-    """One row per (evaluation, result_idx). result_idx is 0-based to match the registry."""
+    EEE arrives as a typed pyarrow Table (validated by `sources.eee.load_arrow_table`
+    against the vendored Pydantic models), so every nested field has a stable
+    STRUCT type and we can read it with dot notation directly.
+    """
     cols = _eee_raw_columns(con)
     if "evaluation_results" not in cols:
         con.execute(
@@ -403,46 +412,28 @@ def stage_b_explode(con) -> int:
         )
         return 0
 
-    # Serialise each evaluation_results[i] to JSON before pulling fields. This
-    # avoids "key not in struct" Binder errors when the JSON-inferred struct
-    # type doesn't carry every spec field for every record (e.g. the optional
-    # `evaluation_result_id`).
-    select_clauses = [
-        _maybe_col(cols, "evaluation_id", "VARCHAR"),
-        _maybe_col(cols, "retrieved_timestamp", "VARCHAR"),
-        _maybe_col(cols, "source_metadata", "JSON"),
-        _maybe_col(cols, "eval_library", "JSON"),
-        _maybe_col(cols, "model_info", "JSON"),
-        _maybe_col(cols, "detailed_evaluation_results", "JSON"),
-        _maybe_col(cols, "source_config", "VARCHAR"),
-        "(idx_1based - 1) AS result_idx",
-        "to_json(e.evaluation_results[idx_1based]) AS _er_json",
-    ]
-
-    con.execute(
-        f"""
-        CREATE TABLE results_exploded_raw AS
-        SELECT
-            {', '.join(select_clauses)}
-        FROM eee_raw e,
-             range(1, len(e.evaluation_results) + 1) AS t(idx_1based)
-        WHERE e.evaluation_results IS NOT NULL
-          AND len(e.evaluation_results) > 0
-        """
-    )
-
     con.execute(
         """
         CREATE TABLE results_exploded AS
         SELECT
-            * EXCLUDE (_er_json),
-            json_extract_string(_er_json, '$.evaluation_result_id') AS evaluation_result_id_raw,
-            json_extract_string(_er_json, '$.evaluation_name')      AS evaluation_name,
-            json_extract(_er_json, '$.source_data')                 AS source_data,
-            json_extract(_er_json, '$.metric_config')               AS metric_config,
-            json_extract(_er_json, '$.score_details')               AS score_details,
-            json_extract(_er_json, '$.generation_config')           AS generation_config
-        FROM results_exploded_raw
+            e.evaluation_id,
+            e.retrieved_timestamp,
+            e.source_metadata,
+            e.eval_library,
+            e.model_info,
+            e.detailed_evaluation_results,
+            e.source_config,
+            (idx_1based - 1) AS result_idx,
+            e.evaluation_results[idx_1based].evaluation_result_id AS evaluation_result_id_raw,
+            e.evaluation_results[idx_1based].evaluation_name      AS evaluation_name,
+            e.evaluation_results[idx_1based].source_data          AS source_data,
+            e.evaluation_results[idx_1based].metric_config        AS metric_config,
+            e.evaluation_results[idx_1based].score_details        AS score_details,
+            e.evaluation_results[idx_1based].generation_config    AS generation_config
+        FROM eee_raw e,
+             range(1, len(e.evaluation_results) + 1) AS t(idx_1based)
+        WHERE e.evaluation_results IS NOT NULL
+          AND len(e.evaluation_results) > 0
         """
     )
 
@@ -470,32 +461,68 @@ def stage_b_explode(con) -> int:
     return con.execute("SELECT count(*) FROM results_exploded").fetchone()[0]
 
 
+def stage_b_count_synth_id_collisions(con) -> int:
+    """Count rows whose synthesised `<evaluation_id>#<result_idx>` happens to
+    equal a real `evaluation_result_id` from another EEE record.
+
+    The synthesised id feeds `fact_id` via `fact_id_udf`, so a collision
+    means two different (evaluation_id, result_idx) tuples could produce
+    the same fact_id and the (snapshot_id, fact_id) primary key contract
+    silently breaks. The counter surfaces in `snapshot_meta.row_counts`
+    so the operator sees it before downstream consumers do; expected to
+    be 0 in normal data.
+    """
+    return con.execute(
+        """
+        WITH synth AS (
+            SELECT evaluation_id || '#' || result_idx::VARCHAR AS synth_id
+            FROM results_exploded
+            WHERE evaluation_result_id_raw IS NULL
+        )
+        SELECT COUNT(*) FROM synth s
+        WHERE EXISTS (
+            SELECT 1 FROM results_exploded r
+            WHERE r.evaluation_result_id_raw = s.synth_id
+        )
+        """
+    ).fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # Stage C — resolve identity
 # ---------------------------------------------------------------------------
 
 
-def stage_c_resolve(con) -> None:
-    # Top-level fields (`source_metadata`, `eval_library`, `model_info`) come
-    # from the EEE record root and are reliably struct-typed (or JSON if the
-    # record didn't carry them). The per-element nested groups (`metric_config`,
-    # etc.) are JSON because Stage B normalises them to dodge schema drift.
+def stage_c_resolve_identities(con) -> None:
+    # Identity inputs come from struct dot notation; the typed Arrow loader
+    # in `sources.eee.load_arrow_table` guarantees stable STRUCT shapes so
+    # JSON-path extraction isn't needed here.
     con.execute(
         """
         CREATE TABLE results_resolved AS
         WITH raw AS (
             SELECT
                 *,
-                json_extract_string(to_json(model_info), '$.id')                  AS _model_raw,
+                model_info.id                                                     AS _model_raw,
                 clean_eval_name_udf(evaluation_name)                              AS _benchmark_raw,
                 extract_metric_udf(
-                    COALESCE(json_extract_string(metric_config, '$.evaluation_description'),
-                             json_extract_string(metric_config, '$.metric_name'),
+                    COALESCE(metric_config.evaluation_description,
+                             metric_config.metric_name,
                              evaluation_name))                                    AS _metric_raw,
-                json_extract_string(to_json(source_metadata), '$.source_organization_name') AS _org_raw,
+                source_metadata.source_organization_name                          AS _org_raw,
+                -- Concatenate name + version for resolver lookup, but treat
+                -- 'unknown'/empty version as no version at all. Upstream EEE
+                -- writes 'unknown' verbatim when the version isn't recorded;
+                -- feeding 'helm unknown' to the resolver guarantees no_match
+                -- (no real registry alias covers the literal 'unknown'
+                -- token). Stripping it gives the resolver a fightable string.
                 trim(
-                    COALESCE(json_extract_string(to_json(eval_library), '$.name'),    '') || ' ' ||
-                    COALESCE(json_extract_string(to_json(eval_library), '$.version'), '')
+                    COALESCE(eval_library.name, '')
+                    || CASE
+                        WHEN eval_library.version IS NULL THEN ''
+                        WHEN lower(trim(eval_library.version)) IN ('', 'unknown') THEN ''
+                        ELSE ' ' || eval_library.version
+                    END
                 )                                                                 AS _harness_raw
             FROM results_exploded
         )
@@ -528,103 +555,126 @@ def stage_c_resolve(con) -> None:
 # ---------------------------------------------------------------------------
 
 
-def stage_d_flatten(con) -> None:
+def stage_d_join_dims_and_flatten(con) -> None:
     """Flatten + JOIN.
 
-    Nested struct types inferred by `read_json_auto` are heterogeneous across
-    EEE records — some configs carry `score_details.uncertainty.standard_error`,
-    some don't. Direct dot-notation on a missing struct field is a Binder
-    error. Workaround: serialise the nested groups to JSON via `to_json` and
-    pull deep values with `json_extract*` (returns NULL on missing path).
-    Top-level fields that are reliably present stay as dot-notation reads.
+    Reads typed STRUCT fields directly via dot notation. The metric-meta
+    hotfix UDF still takes a JSON string for `metric_config` because its
+    internal heuristics walk JSON paths — we `to_json()` at the call site
+    rather than rewriting the UDF.
+
+    `additional_details`, `agentic_eval_config`, `eval_plan`, `eval_limits`,
+    `sandbox` are emitted as JSON strings to preserve the column shape that
+    downstream `fact_results.parquet` consumers expect (the upstream typed
+    shapes for these are still in flux). `generation_args_json` is the
+    canonical serialised form fed to `variant_key_udf` and divergence UDFs.
     """
     con.execute(
         """
         CREATE TABLE fact_results_staging AS
-        WITH json_view AS (
+        WITH joined AS (
+            -- LEFT JOIN dims, then call the metric-meta hotfix UDF once per row
+            -- so its STRUCT result can be destructured cleanly in the outer SELECT
+            -- (single UDF invocation per row, not five).
             SELECT
-                *,
-                to_json(score_details)                AS _sd_json,
-                to_json(generation_config)            AS _gc_json,
-                json_extract(to_json(generation_config), '$.generation_args') AS _ga_json,
-                to_json(source_metadata)              AS _sm_json,
-                to_json(metric_config)                AS _mc_json,
-                to_json(detailed_evaluation_results)  AS _det_json,
-                to_json(eval_library)                 AS _el_json
-            FROM results_resolved
+                rr.*,
+                cb.parent_benchmark_id                                 AS _cb_parent_benchmark_id,
+                cm_model.parent_model_id                               AS _cm_parent_model_id,
+                c.card                                                 AS _card_payload,
+                CASE WHEN c.card IS NOT NULL THEN rr.benchmark_id ELSE NULL END AS _benchmark_card_id,
+                derive_metric_meta_udf(
+                    to_json(rr.metric_config),
+                    cmet.metric_kind, cmet.metric_unit,
+                    cmet.min_score,   cmet.max_score, cmet.lower_is_better,
+                    rr.metric_config.metric_name,
+                    cmet.score_type
+                )                                                      AS _meta
+            FROM results_resolved rr
+            LEFT JOIN canonical_benchmarks cb       ON cb.id = rr.benchmark_id
+            LEFT JOIN canonical_models     cm_model ON cm_model.id = rr.model_id
+            LEFT JOIN canonical_metrics    cmet     ON cmet.id = rr.metric_id
+            LEFT JOIN cards_raw            c        ON c.benchmark_id = rr.benchmark_id
         )
         SELECT
-            rr.fact_id,
-            rr.evaluation_id, rr.result_idx, rr.evaluation_result_id,
+            j.fact_id,
+            j.evaluation_id, j.result_idx, j.evaluation_result_id,
+            -- Carried into Stage E so the fact_id dedup tie-break can keep the
+            -- latest record. Stage F.4 EXCLUDEs it before emitting fact_results.
+            j.retrieved_timestamp,
 
-            rr.model_raw,     rr.model_id,
-            rr.benchmark_raw, rr.benchmark_id,
-            rr.metric_raw,    rr.metric_id,
-            rr.org_raw,       rr.org_id,
-            rr.harness_raw,   rr.harness_id,
+            j.model_raw,     j.model_id,
+            j.benchmark_raw, j.benchmark_id,
+            j.metric_raw,    j.metric_id,
+            j.org_raw,       j.org_id,
+            j.harness_raw,   j.harness_id,
 
-            cb.parent_benchmark_id,
-            cm_model.parent_model_id,
+            j._cb_parent_benchmark_id                                                   AS parent_benchmark_id,
+            j._cm_parent_model_id                                                       AS parent_model_id,
 
-            CASE WHEN c.card IS NOT NULL THEN rr.benchmark_id ELSE NULL END AS benchmark_card_id,
+            j._benchmark_card_id                                                        AS benchmark_card_id,
 
-            rr.model_resolution_strategy, rr.benchmark_resolution_strategy,
-            rr.metric_resolution_strategy, rr.org_resolution_strategy,
-            rr.harness_resolution_strategy,
+            j.model_resolution_strategy, j.benchmark_resolution_strategy,
+            j.metric_resolution_strategy, j.org_resolution_strategy,
+            j.harness_resolution_strategy,
 
-            -- score (top-level scalar — dot OK; nested values via json paths)
-            TRY_CAST(json_extract_string(rr._sd_json, '$.score') AS DOUBLE) AS score,
-            TRY_CAST(json_extract_string(rr._sd_json, '$.uncertainty.standard_error.value') AS DOUBLE) AS score_se,
-            TRY_CAST(json_extract_string(rr._sd_json, '$.uncertainty.confidence_interval.lower') AS DOUBLE) AS score_ci_lower,
-            TRY_CAST(json_extract_string(rr._sd_json, '$.uncertainty.confidence_interval.upper') AS DOUBLE) AS score_ci_upper,
-            TRY_CAST(json_extract_string(rr._sd_json, '$.uncertainty.confidence_interval.confidence_level') AS DOUBLE) AS score_ci_level,
-            TRY_CAST(json_extract_string(rr._sd_json, '$.uncertainty.num_samples') AS INTEGER) AS n_samples,
+            -- score (typed STRUCT access; uncertainty paths are NULL-safe in
+            -- DuckDB when the parent struct is NULL).
+            j.score_details.score                                                       AS score,
+            j.score_details.uncertainty.standard_error.value                            AS score_se,
+            j.score_details.uncertainty.confidence_interval.lower                       AS score_ci_lower,
+            j.score_details.uncertainty.confidence_interval.upper                       AS score_ci_upper,
+            j.score_details.uncertainty.confidence_interval.confidence_level            AS score_ci_level,
+            CAST(j.score_details.uncertainty.num_samples AS INTEGER)                    AS n_samples,
 
             -- source / provenance
-            json_extract_string(rr._sm_json, '$.evaluator_relationship') AS evaluator_relationship,
-            json_extract_string(rr._sm_json, '$.source_type') AS source_type,
-            json_extract_string(rr._sm_json, '$.source_organization_url') AS source_organization_url,
-            json_extract_string(rr._el_json, '$.name')    AS eval_library_name,
-            json_extract_string(rr._el_json, '$.version') AS eval_library_version,
+            j.source_metadata.evaluator_relationship                                    AS evaluator_relationship,
+            j.source_metadata.source_type                                               AS source_type,
+            j.source_metadata.source_organization_url                                   AS source_organization_url,
+            j.eval_library.name                                                         AS eval_library_name,
+            j.eval_library.version                                                      AS eval_library_version,
 
-            -- metric meta from canonical_metrics
-            cmet.metric_kind                                                              AS metric_kind,
-            cmet.metric_unit                                                              AS metric_unit,
-            cmet.lower_is_better                                                          AS lower_is_better,
-            cmet.min_score                                                                AS min_score,
-            cmet.max_score                                                                AS max_score,
+            -- metric meta destructured from the resolver UDF struct (see joined CTE).
+            -- Layered chain: registry > EEE per-record > heuristic > NULL.
+            -- The *_provenance columns surface which step of the chain produced
+            -- the value; lets consumers distinguish a real metric_kind='score'
+            -- from the catchall and filter rows for registry-side fixes.
+            j._meta.metric_kind                                                         AS metric_kind,
+            j._meta.metric_unit                                                         AS metric_unit,
+            j._meta.lower_is_better                                                     AS lower_is_better,
+            j._meta.min_score                                                           AS min_score,
+            j._meta.max_score                                                           AS max_score,
+            j._meta.metric_kind_provenance                                              AS metric_kind_provenance,
+            j._meta.metric_unit_provenance                                              AS metric_unit_provenance,
 
-            -- generation config — flattened via JSON path (heterogeneous shape)
-            TRY_CAST(json_extract_string(rr._ga_json, '$.temperature') AS DOUBLE)         AS temperature,
-            TRY_CAST(json_extract_string(rr._ga_json, '$.top_p')       AS DOUBLE)         AS top_p,
-            TRY_CAST(json_extract_string(rr._ga_json, '$.top_k')       AS DOUBLE)         AS top_k,
-            TRY_CAST(json_extract_string(rr._ga_json, '$.max_tokens')  AS INTEGER)        AS max_tokens,
-            json_extract_string(rr._ga_json, '$.prompt_template')                         AS prompt_template,
-            TRY_CAST(json_extract_string(rr._ga_json, '$.reasoning')   AS BOOLEAN)        AS reasoning,
-            json_extract(rr._ga_json, '$.agentic_eval_config')                            AS agentic_eval_config,
-            json_extract(rr._ga_json, '$.eval_plan')                                      AS eval_plan,
-            json_extract(rr._ga_json, '$.eval_limits')                                    AS eval_limits,
-            json_extract(rr._ga_json, '$.sandbox')                                        AS sandbox,
+            -- generation config — typed STRUCT access for scalars; nested
+            -- objects (agentic config / eval plan / etc.) emitted as JSON to
+            -- match the existing parquet column shape.
+            j.generation_config.generation_args.temperature                              AS temperature,
+            j.generation_config.generation_args.top_p                                    AS top_p,
+            j.generation_config.generation_args.top_k                                    AS top_k,
+            CAST(j.generation_config.generation_args.max_tokens AS INTEGER)              AS max_tokens,
+            j.generation_config.generation_args.prompt_template                          AS prompt_template,
+            j.generation_config.generation_args.reasoning                                AS reasoning,
+            CAST(to_json(j.generation_config.generation_args.agentic_eval_config) AS VARCHAR) AS agentic_eval_config,
+            CAST(to_json(j.generation_config.generation_args.eval_plan)           AS VARCHAR) AS eval_plan,
+            CAST(to_json(j.generation_config.generation_args.eval_limits)         AS VARCHAR) AS eval_limits,
+            CAST(to_json(j.generation_config.generation_args.sandbox)             AS VARCHAR) AS sandbox,
 
-            CAST(rr._ga_json AS VARCHAR)                                                  AS generation_args_json,
+            CAST(to_json(j.generation_config.generation_args) AS VARCHAR)                AS generation_args_json,
 
-            json_extract(rr._sm_json, '$.additional_details')                             AS source_additional_details,
-            json_extract(rr._gc_json, '$.additional_details')                             AS generation_additional_details,
-            json_extract(rr._mc_json, '$.additional_details')                             AS metric_additional_details,
+            CAST(to_json(j.source_metadata.additional_details)   AS VARCHAR) AS source_additional_details,
+            CAST(to_json(j.generation_config.additional_details) AS VARCHAR) AS generation_additional_details,
+            CAST(to_json(j.metric_config.additional_details)     AS VARCHAR) AS metric_additional_details,
 
             -- instance pointer
-            json_extract_string(rr._det_json, '$.file_path')                              AS instance_file_path,
-            json_extract_string(rr._det_json, '$.format')                                 AS instance_file_format,
-            json_extract_string(rr._det_json, '$.checksum')                               AS instance_checksum,
-            json_extract_string(rr._det_json, '$.hash_algorithm')                         AS instance_hash_algorithm,
-            TRY_CAST(json_extract_string(rr._det_json, '$.total_rows') AS INTEGER)        AS instance_rows,
+            j.detailed_evaluation_results.file_path                                      AS instance_file_path,
+            j.detailed_evaluation_results.format                                         AS instance_file_format,
+            j.detailed_evaluation_results.checksum                                       AS instance_checksum,
+            j.detailed_evaluation_results.hash_algorithm                                 AS instance_hash_algorithm,
+            CAST(j.detailed_evaluation_results.total_rows AS INTEGER)                    AS instance_rows,
 
-            c.card AS card_payload
-        FROM json_view rr
-        LEFT JOIN canonical_benchmarks cb       ON cb.id = rr.benchmark_id
-        LEFT JOIN canonical_models     cm_model ON cm_model.id = rr.model_id
-        LEFT JOIN canonical_metrics    cmet     ON cmet.id = rr.metric_id
-        LEFT JOIN cards_raw            c        ON c.benchmark_id = rr.benchmark_id
+            j._card_payload AS card_payload
+        FROM joined j
         """
     )
 
@@ -634,11 +684,46 @@ def stage_d_flatten(con) -> None:
 # ---------------------------------------------------------------------------
 
 
-def stage_e_per_row_signals(con) -> tuple[int, int]:
-    """Returns (row_count_before_drop, row_count_after_drop)."""
+_SENTINEL_DROP_PREDICATE = """
+    score = -1.0
+    AND (
+        (metric_unit IS NOT NULL AND metric_unit IN ('proportion', 'percent'))
+        OR (min_score IS NOT NULL AND -1.0 < min_score)
+    )
+"""
+
+
+def stage_e_per_row_signals(con) -> StageEStats:
+    """Compute per-row signals + apply two drop policies, in this order:
+
+    1. **No-score drop** — `score IS NULL`. The row carries no measurement.
+    2. **Sentinel drop** — `score = -1` on a metric whose declared scale
+       (`metric_unit ∈ {proportion, percent}` or `min_score > -1`)
+       excludes it. HELM emits `-1` as "evaluation failed / not scored";
+       without this filter the negative sentinel poisons divergence +
+       comparability aggregations. Rows whose declared scale could
+       legitimately include `-1` (e.g. a delta or correlation metric)
+       pass through untouched.
+    3. **fact_id dedup** — multiple records may collide on
+       `(snapshot_id, fact_id)`; keep the latest by `retrieved_timestamp`,
+       tie-breaking on `evaluation_id` for determinism.
+
+    Per-row signals computed: reproducibility gap, provenance source-type
+    collapse, variant_key, score_scale_anomaly, reporting completeness.
+    Completeness is per-row (3 of the 28 fields are EEE source_metadata
+    that vary across reports); the UDF is invoked once per row in the
+    `scored` CTE and destructured in the outer SELECT.
+    """
     pre = con.execute("SELECT count(*) FROM fact_results_staging").fetchone()[0]
+    n_dropped_no_score = con.execute(
+        "SELECT count(*) FROM fact_results_staging WHERE score IS NULL"
+    ).fetchone()[0]
+    n_dropped_sentinel = con.execute(
+        f"SELECT count(*) FROM fact_results_staging "
+        f"WHERE score IS NOT NULL AND ({_SENTINEL_DROP_PREDICATE})"
+    ).fetchone()[0]
     con.execute(
-        """
+        f"""
         CREATE TABLE fact_results_signaled AS
         WITH base AS (
             SELECT
@@ -651,48 +736,113 @@ def stage_e_per_row_signals(con) -> tuple[int, int]:
                 eval_plan             IS NOT NULL  AS has_eval_plan,
                 eval_limits           IS NOT NULL  AS has_eval_limits,
                 agentic_eval_config   IS NOT NULL  AS has_agentic_eval_config,
+                -- reserved EvalCards fields (registry doesn't carry them today;
+                -- defined here so completeness UDF and final fact_results column
+                -- read the same source)
+                CAST(NULL AS VARCHAR) AS lifecycle_status,
+                CAST(NULL AS VARCHAR) AS preregistration_url,
                 is_agentic_udf(benchmark_id, to_json(card_payload), generation_args_json) AS is_agentic
             FROM fact_results_staging
             WHERE score IS NOT NULL
+              AND NOT ({_SENTINEL_DROP_PREDICATE})
+        ),
+        scored AS (
+            -- One UDF call per row; destructured below. Without the CTE,
+            -- DuckDB would invoke the UDF once per dereferenced field.
+            -- repro_missing_fields is built here from per-field has_* flags
+            -- so the rest of the SELECT can reference it without recomputing.
+            SELECT base.*,
+                compute_completeness_udf(
+                    to_json(card_payload),
+                    source_type,
+                    org_raw,                         -- source_organization_name
+                    evaluator_relationship,
+                    lifecycle_status,
+                    preregistration_url
+                ) AS _completeness,
+                ({_REPRO_MISSING_FIELDS_SQL}
+                ) AS repro_missing_fields,
+                (CASE WHEN is_agentic THEN {_REPRO_AGENTIC_COUNT} ELSE {_REPRO_BASE_COUNT} END) AS repro_required_count
+            FROM base
+        ),
+        signaled AS (
+            SELECT
+                *,
+                len(repro_missing_fields) > 0 AS has_reproducibility_gap,
+                (repro_required_count - len(repro_missing_fields)) AS repro_populated_count,
+
+                COALESCE(
+                    CASE WHEN evaluator_relationship = 'other' THEN 'unspecified'
+                         ELSE evaluator_relationship
+                    END, 'unspecified'
+                ) AS provenance_source_type,
+
+                variant_key_udf(generation_args_json) AS variant_key,
+
+                -- score_scale_anomaly: row claims a score that contradicts the
+            -- metric's declared range. Two cases, OR-ed together:
+            --   (1) metric_unit='proportion' but score ∉ [0,1]
+            --       (handles registry-missing min/max for proportion metrics).
+            --   (2) min_score/max_score declared and score falls outside.
+            -- Both clauses are NULL-safe — a NULL declared bound or unit
+            -- contributes FALSE, not NULL.
+            (
+                (metric_unit IS NOT NULL AND metric_unit = 'proportion'
+                 AND (score < 0 OR score > 1))
+                OR (min_score IS NOT NULL AND score < min_score)
+                OR (max_score IS NOT NULL AND score > max_score)
+            ) AS score_scale_anomaly,
+
+                -- reporting completeness destructured from the `scored` CTE
+                _completeness.completeness_score                   AS completeness_score,
+                _completeness.total_fields_evaluated               AS completeness_total_fields_evaluated,
+                _completeness.populated_count                      AS completeness_populated_count,
+                _completeness.missing_required_fields              AS completeness_missing_required_fields,
+                _completeness.partial_fields                       AS completeness_partial_fields
+            FROM scored
+        ),
+        ranked AS (
+            -- Dedup on (snapshot_id, fact_id): same fact_id appearing more
+            -- than once is real upstream (multi-run reports of one eval);
+            -- keep the latest by retrieved_timestamp, break ties on
+            -- evaluation_id so the choice is byte-stable across re-runs.
+            -- CASE pins NULL fact_ids to rank 1 — they can't collide and
+            -- shouldn't be silently merged by a NULL-collapsing PARTITION BY.
+            SELECT *,
+                CASE WHEN fact_id IS NULL THEN 1
+                     ELSE ROW_NUMBER() OVER (
+                         PARTITION BY fact_id
+                         ORDER BY retrieved_timestamp DESC NULLS LAST,
+                                  evaluation_id DESC
+                     )
+                END AS _dedup_rank
+            FROM signaled
         )
-        SELECT
-            *,
-            CASE WHEN is_agentic
-                 THEN NOT (has_temperature AND has_max_tokens
-                           AND has_eval_plan AND has_eval_limits)
-                 ELSE NOT (has_temperature AND has_max_tokens)
-            END AS has_reproducibility_gap,
-
-            compute_repro_missing_udf(
-                is_agentic, has_temperature, has_max_tokens, has_eval_plan, has_eval_limits
-            ) AS repro_missing_fields,
-
-            CASE WHEN is_agentic THEN 4 ELSE 2 END AS repro_required_count,
-
-            (CASE WHEN is_agentic THEN 4 ELSE 2 END
-                - len(compute_repro_missing_udf(
-                    is_agentic, has_temperature, has_max_tokens,
-                    has_eval_plan, has_eval_limits
-                ))) AS repro_populated_count,
-
-            COALESCE(
-                CASE WHEN evaluator_relationship = 'other' THEN 'unspecified'
-                     ELSE evaluator_relationship
-                END, 'unspecified'
-            ) AS provenance_source_type,
-
-            variant_key_udf(generation_args_json) AS variant_key,
-
-            (metric_unit = 'proportion' AND (score < 0 OR score > 1)) AS score_scale_anomaly,
-
-            -- reserved EvalCards fields (not yet populated)
-            CAST(NULL AS VARCHAR) AS lifecycle_status,
-            CAST(NULL AS VARCHAR) AS preregistration_url
-        FROM base
+        SELECT * EXCLUDE (_dedup_rank) FROM ranked WHERE _dedup_rank = 1
         """
     )
     post = con.execute("SELECT count(*) FROM fact_results_signaled").fetchone()[0]
-    return pre, post
+    pre_dedup = pre - n_dropped_no_score - n_dropped_sentinel
+    n_dropped_dedup = pre_dedup - post
+    if n_dropped_sentinel:
+        log.warning(
+            "Stage E: dropped %d row(s) on the score=-1 sentinel policy "
+            "(metric scale excludes -1).",
+            n_dropped_sentinel,
+        )
+    if n_dropped_dedup:
+        log.warning(
+            "Stage E: dropped %d fact_id collision(s); kept latest by "
+            "retrieved_timestamp.",
+            n_dropped_dedup,
+        )
+    return StageEStats(
+        pre=pre,
+        n_dropped_no_score=n_dropped_no_score,
+        n_dropped_sentinel=n_dropped_sentinel,
+        n_dropped_dedup=n_dropped_dedup,
+        post=post,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,14 +850,20 @@ def stage_e_per_row_signals(con) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def stage_f_group_signals(con, snapshot_id: str) -> None:
+def stage_f_group_signals(con, snapshot_id: str) -> int:
+    """Returns the count of comparability groups whose rows reported >1
+    distinct `metric_unit`. A non-zero count means the per-group divergence
+    threshold was computed against a deterministic-but-not-row-matching
+    unit, and the operator should backfill the registry's metric_unit
+    column for the offending canonical metric.
+    """
     # F.1 — group-derived provenance
     con.execute(
-        """
+        f"""
         CREATE TABLE fact_results_grouped AS
         WITH org_normalized AS (
             SELECT *,
-                NULLIF(trim(regexp_replace(lower(org_raw), '\\s+', ' ', 'g')), '')
+                {org_normalize_sql('org_raw')}
                   AS org_normalized_key
             FROM fact_results_signaled
             WHERE model_id IS NOT NULL
@@ -726,7 +882,7 @@ def stage_f_group_signals(con, snapshot_id: str) -> None:
         SELECT
             o.*,
             go.distinct_reporting_orgs,
-            substr(md5(o.model_id || '|' || o.benchmark_id || '|' || o.metric_id), 1, 16)
+            md5(o.model_id || '|' || o.benchmark_id || '|' || o.metric_id)
               AS comparability_group_id,
             go.distinct_reporting_orgs > 1 AS is_multi_source,
             (o.provenance_source_type = 'first_party' AND go.distinct_reporting_orgs = 1)
@@ -736,7 +892,16 @@ def stage_f_group_signals(con, snapshot_id: str) -> None:
         """
     )
 
-    # F.2 — variant + cross-party divergence
+    # F.2 — variant + cross-party divergence.
+    #
+    # Per-group metric_config used by the divergence threshold MUST be
+    # deterministic across re-runs and consistent across all rows in the
+    # group. MAX FILTER picks the same value every time (vs `any_value`
+    # which is order-dependent). When the registry is sparse, the hotfix
+    # may produce different metric_unit values across rows in the same
+    # canonical metric — `n_metric_unit_distinct` surfaces those groups
+    # so the operator can target a registry-alias backfill at the right
+    # canonical metric.
     con.execute(
         """
         CREATE TABLE fact_results_grouped_annotated AS
@@ -751,12 +916,12 @@ def stage_f_group_signals(con, snapshot_id: str) -> None:
                     evaluator_relationship   := evaluator_relationship,
                     source_organization_name := org_raw
                 )) AS group_rows,
-                any_value(struct_pack(
-                    metric_kind := metric_kind,
-                    metric_unit := metric_unit,
-                    min_score   := min_score,
-                    max_score   := max_score
-                )) AS metric_config
+                struct_pack(
+                    metric_kind := MAX(metric_kind) FILTER (WHERE metric_kind IS NOT NULL),
+                    metric_unit := MAX(metric_unit) FILTER (WHERE metric_unit IS NOT NULL),
+                    min_score   := MAX(min_score)   FILTER (WHERE min_score   IS NOT NULL),
+                    max_score   := MAX(max_score)   FILTER (WHERE max_score   IS NOT NULL)
+                ) AS metric_config
             FROM fact_results_grouped
             GROUP BY 1, 2, 3
         ),
@@ -793,14 +958,15 @@ def stage_f_group_signals(con, snapshot_id: str) -> None:
         CREATE TABLE fact_results AS
         SELECT
             TIMESTAMP '{snapshot_id_to_sql(snapshot_id)}' AS snapshot_id,
-            * EXCLUDE (card_payload, org_normalized_key, generation_args_json)
+            * EXCLUDE (card_payload, org_normalized_key, generation_args_json,
+                       _completeness)
         FROM fact_results_grouped_annotated
 
         UNION ALL BY NAME
 
         SELECT
             TIMESTAMP '{snapshot_id_to_sql(snapshot_id)}' AS snapshot_id,
-            fr.* EXCLUDE (card_payload, generation_args_json),
+            fr.* EXCLUDE (card_payload, generation_args_json, _completeness),
             CAST(NULL AS INTEGER)                              AS distinct_reporting_orgs,
             CAST(NULL AS VARCHAR)                              AS comparability_group_id,
             CAST(NULL AS BOOLEAN)                              AS is_multi_source,
@@ -822,6 +988,31 @@ def stage_f_group_signals(con, snapshot_id: str) -> None:
         """
     )
 
+    # Operator-visible counter: which (model, benchmark, metric) groups had
+    # rows reporting more than one distinct metric_unit. Each such group's
+    # variant_threshold_basis was computed against the deterministic-but-
+    # not-row-matching unit picked by the F.2 MAX FILTER aggregation.
+    n_unit_inconsistent = con.execute(
+        """
+        SELECT COUNT(*) FROM (
+            SELECT model_id, benchmark_id, metric_id
+            FROM fact_results_grouped
+            GROUP BY 1, 2, 3
+            HAVING COUNT(DISTINCT metric_unit)
+                   FILTER (WHERE metric_unit IS NOT NULL) > 1
+        )
+        """
+    ).fetchone()[0]
+    if n_unit_inconsistent:
+        log.warning(
+            "Stage F: %d comparability group(s) had >1 distinct metric_unit "
+            "across rows; the per-group threshold basis label may not match "
+            "every row's own unit. Backfill the registry's metric_unit for "
+            "the offending canonical metric to silence.",
+            n_unit_inconsistent,
+        )
+    return n_unit_inconsistent
+
 
 def snapshot_id_to_sql(snapshot_id: str) -> str:
     """DuckDB's TIMESTAMP literal doesn't accept the trailing 'Z'. Strip it
@@ -835,17 +1026,34 @@ def snapshot_id_to_sql(snapshot_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def stage_g_dims(con, snapshot_id: str) -> None:
+def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
     sid = snapshot_id_to_sql(snapshot_id)
 
     # benchmarks.parquet — accesses card subfields via JSON path so missing
     # struct fields don't raise; the card schema is heterogeneous across the
     # cards corpus (some carry _generated_by / flagged_fields, some don't).
+    #
+    # `card_missing_per_benchmark` aggregates the autobenchmarkcard.* gap
+    # once per benchmark so the outer SELECT is a deterministic JOIN. A
+    # naive LIMIT-1 correlated subquery picks an arbitrary fact row, which
+    # breaks byte-stable reproducibility across re-runs even though every
+    # row for the same benchmark carries the same card_payload.
     con.execute(
         f"""
         CREATE TABLE benchmarks AS
         WITH cards_json AS (
             SELECT card_key, benchmark_id, to_json(card) AS card_j FROM cards_raw
+        ),
+        card_missing_per_benchmark AS (
+            SELECT
+                benchmark_id,
+                MAX(len(list_filter(
+                    completeness_missing_required_fields,
+                    x -> starts_with(x, 'autobenchmarkcard.')
+                ))) AS card_missing_count
+            FROM fact_results
+            WHERE benchmark_id IS NOT NULL
+            GROUP BY benchmark_id
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
@@ -856,7 +1064,7 @@ def stage_g_dims(con, snapshot_id: str) -> None:
             cb.dataset_repo,
             cb.parent_benchmark_id,
             TRY_CAST(from_json(cb.tags, '["VARCHAR"]') AS VARCHAR[]) AS registry_tags,
-            cb.metadata AS registry_metadata,
+            TRY_CAST(cb.metadata AS JSON) AS registry_metadata,
             cb.review_status,
 
             json_extract_string(c.card_j, '$.benchmark_details.name')      AS card_name,
@@ -890,22 +1098,32 @@ def stage_g_dims(con, snapshot_id: str) -> None:
             json_extract_string(c.card_j, '$.ethical_and_legal_considerations.consent_procedures')           AS consent_procedures,
             json_extract_string(c.card_j, '$.ethical_and_legal_considerations.compliance_with_regulations')  AS compliance_with_regulations,
 
-            json_extract(c.card_j, '$.possible_risks') AS possible_risks,
+            -- possible_risks: typed STRUCT array. Upstream cards populate
+            -- only category, description, url; description is always a LIST
+            -- of strings, never a scalar. TRY_CAST returns NULL when the
+            -- card omits the field entirely.
+            TRY_CAST(from_json(
+                json_extract(c.card_j, '$.possible_risks'),
+                '[{{"category": "VARCHAR", "description": "VARCHAR[]", "url": "VARCHAR"}}]'
+            ) AS STRUCT(category VARCHAR, description VARCHAR[], url VARCHAR)[]) AS possible_risks,
             json_extract(c.card_j, '$.flagged_fields') AS flagged_fields,
 
             (c.card_j IS NOT NULL) AS card_present,
             json_extract_string(c.card_j, '$._generated_by') AS card_generated_by,
             COALESCE(len(json_keys(json_extract(c.card_j, '$.flagged_fields'))), 0) AS card_flagged_count,
-            CAST(NULL AS INTEGER) AS card_missing_count
+            cmpb.card_missing_count
 
         FROM canonical_benchmarks cb
-        LEFT JOIN cards_json c ON c.benchmark_id = cb.id
+        LEFT JOIN cards_json c                    ON c.benchmark_id = cb.id
+        LEFT JOIN card_missing_per_benchmark cmpb ON cmpb.benchmark_id = cb.id
         WHERE cb.id IN (SELECT DISTINCT benchmark_id FROM fact_results
                         WHERE benchmark_id IS NOT NULL)
         """
     )
 
-    # models.parquet
+    # models.parquet — registry now carries lineage as a typed `parents`
+    # JSON list and surfaces release_date / open_weights / params_billions
+    # / lineage_origin_org_id / root_model_id directly.
     con.execute(
         f"""
         CREATE TABLE models AS
@@ -920,21 +1138,20 @@ def stage_g_dims(con, snapshot_id: str) -> None:
             cm.architecture,
             cm.params_billions,
             cm.parent_model_id,
+            cm.root_model_id,
+            cm.lineage_origin_org_id,
+            cm.open_weights,
+            cm.release_date,
+            cm.parents                                              AS lineage_parents,
             TRY_CAST(from_json(cm.tags, '["VARCHAR"]') AS VARCHAR[]) AS registry_tags,
-            cm.metadata AS registry_metadata,
+            TRY_CAST(cm.metadata AS JSON) AS registry_metadata,
             cm.review_status,
 
             co.display_name        AS org_display_name,
             co.website             AS org_website,
             co.hf_org              AS org_hf_org,
-            co.parent_org_id       AS org_parent_id,
-
-            cm.released,
-            cm.context_tokens,
-            cm.context_label,
-            cm.modality,
-            cm.access,
-            cm.license
+            co.kind                AS org_kind,
+            co.parent_org_id       AS org_parent_id
 
         FROM canonical_models cm
         LEFT JOIN canonical_orgs co ON co.id = cm.org_id
@@ -945,48 +1162,9 @@ def stage_g_dims(con, snapshot_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stage H — benchmark_completeness
+# Stage H removed — completeness is per-row, computed in Stage E.
+# Stage G derives benchmarks.card_missing_count inline from fact_results.
 # ---------------------------------------------------------------------------
-
-
-def stage_h_completeness(con, snapshot_id: str) -> None:
-    sid = snapshot_id_to_sql(snapshot_id)
-    con.execute(
-        f"""
-        CREATE TABLE benchmark_completeness AS
-        WITH scored AS (
-            SELECT
-                cb.id AS benchmark_id,
-                compute_completeness_udf(to_json(c.card)) AS comp
-            FROM canonical_benchmarks cb
-            LEFT JOIN cards_raw c ON c.benchmark_id = cb.id
-            WHERE cb.id IN (SELECT DISTINCT benchmark_id FROM fact_results
-                            WHERE benchmark_id IS NOT NULL)
-        )
-        SELECT
-            TIMESTAMP '{sid}' AS snapshot_id,
-            benchmark_id,
-            comp.completeness_score        AS completeness_score,
-            comp.total_fields_evaluated    AS total_fields_evaluated,
-            comp.populated_count           AS populated_count,
-            comp.missing_required_fields   AS missing_required_fields,
-            comp.partial_fields            AS partial_fields,
-            comp.field_scores              AS field_scores
-        FROM scored
-        """
-    )
-
-    con.execute(
-        """
-        UPDATE benchmarks AS b
-        SET card_missing_count = (
-            SELECT len(bc.missing_required_fields)
-            FROM benchmark_completeness bc
-            WHERE bc.snapshot_id = b.snapshot_id
-              AND bc.benchmark_id = b.benchmark_id
-        )
-        """
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -994,14 +1172,1187 @@ def stage_h_completeness(con, snapshot_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def stage_i_emit(con, out_dir: Path) -> None:
+def stage_i_emit_warehouse_parquets(con, out_dir: Path, snapshot_id: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    sid = snapshot_id_to_sql(snapshot_id)
     for table, sort_key in [
         ("fact_results", "(model_id, benchmark_id, metric_id)"),
-        ("benchmark_completeness", "(benchmark_id)"),
         ("benchmarks", "(benchmark_id)"),
         ("models", "(model_id)"),
-        ("canonical_metrics", "(id)"),
+    ]:
+        path = out_dir / f"{table}.parquet"
+        con.execute(
+            f"""
+            COPY (SELECT * FROM {table} ORDER BY {sort_key} NULLS LAST)
+            TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+        )
+
+    # canonical_metrics is COPYed straight from the registry; inject
+    # snapshot_id so it satisfies the append-only contract every other
+    # warehouse table follows.
+    path = out_dir / "canonical_metrics.parquet"
+    con.execute(
+        f"""
+        COPY (
+            SELECT TIMESTAMP '{sid}' AS snapshot_id, *
+            FROM canonical_metrics
+            ORDER BY id NULLS LAST
+        )
+        TO '{path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage J — view-layer materialisation
+# ---------------------------------------------------------------------------
+
+
+def stage_j_eval_results_view(con, snapshot_id: str) -> None:
+    """Materialise `eval_results_view` — one row per (benchmark, metric, model)
+    triple. Foundation view: models_view + evals_view fan out from this.
+
+    The view is denormalised so the frontend's `ModelResultForBenchmark`
+    cast is a no-op spread. JOINs onto `models`, `benchmarks`, and
+    `canonical_metrics` happen here so the read side never JOINs.
+
+    **Representative score rule** — a triple may have multiple fact rows
+    (different orgs, setup variants). The view collapses to one row per
+    triple. Score is the median over fact rows, layered: prefer first-party
+    scores when any exist; else all rows. NULL when every row's score is
+    NULL. Per-row context (timestamps, source metadata, instance pointer,
+    eval library) comes from a representative row chosen by:
+    `(score IS NOT NULL DESC, evaluator_relationship='first_party' DESC,
+      evaluation_id ASC)`.
+
+    **Position / total / percentile** — per `(benchmark_id, metric_id)`
+    partition, rows are ranked honouring `lower_is_better`. NULL-score
+    rows survive in the view (for coverage purposes) but are excluded
+    from `position` / `total`. `percentile` = `1 - (position-1) / (total-1)`.
+    """
+    sid = snapshot_id_to_sql(snapshot_id)
+
+    eval_annotation_struct_type = (
+        "STRUCT("
+        "reproducibility_gap STRUCT("
+        "  missing_fields VARCHAR[],"
+        "  populated_count INTEGER,"
+        "  required_count INTEGER"
+        "),"
+        "provenance STRUCT("
+        "  source_type VARCHAR,"
+        "  evaluator_relationship VARCHAR,"
+        "  organization_name VARCHAR"
+        "),"
+        "variant_divergence STRUCT("
+        "  magnitude DOUBLE,"
+        "  threshold DOUBLE,"
+        "  basis VARCHAR,"
+        '  differing_fields STRUCT(field VARCHAR, "values" JSON)[]'
+        "),"
+        "cross_party_divergence STRUCT("
+        "  magnitude DOUBLE,"
+        "  threshold DOUBLE,"
+        "  basis VARCHAR,"
+        '  differing_fields STRUCT(field VARCHAR, "values" JSON)[],'
+        "  organization_count INTEGER"
+        ")"
+        ")"
+    )
+
+    aggregate_components_type = (
+        "STRUCT("
+        "evaluation_id VARCHAR,"
+        "composite_benchmark_key VARCHAR,"
+        "composite_benchmark_name VARCHAR,"
+        "score DOUBLE,"
+        "normalized_score DOUBLE,"
+        "evaluation_timestamp TIMESTAMP,"
+        "source_name VARCHAR,"
+        "source_type VARCHAR,"
+        "source_organization_name VARCHAR,"
+        "evaluator_relationship VARCHAR"
+        ")[]"
+    )
+
+    con.execute(
+        f"""
+        CREATE TABLE eval_results_view AS
+        WITH benchmark_categories AS (
+            -- Call categorise_benchmark_udf once per benchmark, not once
+            -- per triple. Without this CTE the UDF crosses the Python
+            -- boundary for every (model, benchmark, metric) row in the
+            -- view — wasted work since the input is constant per benchmark.
+            SELECT
+                benchmark_id,
+                categorise_benchmark_udf(domains, tasks, registry_tags) AS category
+            FROM benchmarks
+        ),
+        tris AS (
+            SELECT *
+            FROM fact_results
+            WHERE model_id     IS NOT NULL
+              AND benchmark_id IS NOT NULL
+              AND metric_id    IS NOT NULL
+        ),
+        tri_agg AS (
+            SELECT
+                model_id, benchmark_id, metric_id,
+                CAST(COUNT(*) AS INTEGER) AS fact_row_count,
+                -- Median rule: prefer first-party scores; fall back to all rows.
+                COALESCE(
+                    MEDIAN(score) FILTER (
+                        WHERE evaluator_relationship = 'first_party'
+                          AND score IS NOT NULL
+                    ),
+                    MEDIAN(score) FILTER (WHERE score IS NOT NULL)
+                ) AS rep_score,
+                BOOL_OR(evaluator_relationship = 'first_party') AS has_first_party,
+                BOOL_OR(evaluator_relationship = 'third_party') AS has_third_party,
+                ARRAY_AGG(DISTINCT evaluator_relationship)
+                    FILTER (WHERE evaluator_relationship IS NOT NULL)
+                    AS evaluator_relationships,
+                ARRAY_AGG(DISTINCT org_raw)
+                    FILTER (WHERE org_raw IS NOT NULL)
+                    AS reporting_orgs,
+                -- Group-derived columns are constant within a triple by Stage F's
+                -- construction; ANY_VALUE is exact.
+                ANY_VALUE(scores_by_organization)        AS scores_by_organization,
+                ANY_VALUE(is_multi_source)               AS is_multi_source,
+                ANY_VALUE(first_party_only)              AS first_party_only,
+                ANY_VALUE(has_variant_divergence)        AS has_variant_divergence,
+                ANY_VALUE(has_cross_party_divergence)    AS has_cross_party_divergence,
+                ANY_VALUE(variant_divergence_magnitude)  AS variant_divergence_magnitude,
+                ANY_VALUE(variant_divergence_threshold)  AS variant_divergence_threshold,
+                ANY_VALUE(variant_threshold_basis)       AS variant_threshold_basis,
+                ANY_VALUE(variant_differing_fields)      AS variant_differing_fields,
+                ANY_VALUE(cross_party_divergence_magnitude) AS cross_party_divergence_magnitude,
+                ANY_VALUE(cross_party_divergence_threshold) AS cross_party_divergence_threshold,
+                ANY_VALUE(cross_party_threshold_basis)      AS cross_party_threshold_basis,
+                ANY_VALUE(cross_party_differing_fields)     AS cross_party_differing_fields,
+                ANY_VALUE(cross_party_org_count)            AS cross_party_org_count,
+                BOOL_OR(has_reproducibility_gap)         AS triple_has_repro_gap,
+                AVG(completeness_score)                  AS triple_avg_completeness
+            FROM tris
+            GROUP BY 1, 2, 3
+        ),
+        tri_rep_ranked AS (
+            -- Pick one representative fact row per triple.
+            -- Order: scored rows first → first-party first → lowest evaluation_id.
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY model_id, benchmark_id, metric_id
+                    ORDER BY
+                        CASE WHEN score IS NULL THEN 1 ELSE 0 END ASC,
+                        CASE WHEN evaluator_relationship = 'first_party' THEN 0 ELSE 1 END ASC,
+                        evaluation_id ASC
+                ) AS _rep_rank
+            FROM tris
+        ),
+        tri_rep AS (
+            SELECT * FROM tri_rep_ranked WHERE _rep_rank = 1
+        ),
+        joined AS (
+            SELECT
+                ta.*,
+                tr.evaluation_id              AS rep_evaluation_id,
+                tr.fact_id                    AS rep_fact_id,
+                tr.retrieved_timestamp        AS rep_retrieved_timestamp,
+                tr.evaluator_relationship     AS rep_evaluator_relationship,
+                tr.provenance_source_type     AS rep_provenance_source_type,
+                tr.org_raw                    AS rep_org_raw,
+                tr.source_type                AS rep_source_type,
+                tr.source_organization_url    AS rep_source_org_url,
+                tr.eval_library_name          AS rep_eval_library_name,
+                tr.eval_library_version       AS rep_eval_library_version,
+                tr.score_se                   AS rep_score_se,
+                tr.score_ci_lower             AS rep_ci_lower,
+                tr.score_ci_upper             AS rep_ci_upper,
+                tr.score_ci_level             AS rep_ci_level,
+                tr.n_samples                  AS rep_n_samples,
+                tr.lower_is_better            AS rep_lower_is_better,
+                tr.metric_unit                AS rep_metric_unit,
+                tr.parent_benchmark_id        AS rep_parent_benchmark_id,
+                tr.model_raw                  AS rep_model_raw,
+                tr.repro_missing_fields       AS rep_repro_missing_fields,
+                tr.repro_populated_count      AS rep_repro_populated_count,
+                tr.repro_required_count       AS rep_repro_required_count,
+                tr.instance_file_path         AS rep_instance_file_path,
+                tr.instance_file_format       AS rep_instance_file_format,
+                tr.instance_rows              AS rep_instance_rows,
+                m.display_name                AS m_display_name,
+                m.developer                   AS m_developer,
+                m.org_display_name            AS m_org_display_name,
+                m.architecture                AS m_architecture,
+                m.params_billions             AS m_params_billions,
+                m.release_date                AS m_release_date,
+                m.open_weights                AS m_open_weights,
+                cmet.display_name             AS metric_display_name,
+                b.parent_benchmark_id         AS b_parent_benchmark_id,
+                bc.category                   AS b_category
+            FROM tri_agg ta
+            JOIN tri_rep tr USING (model_id, benchmark_id, metric_id)
+            LEFT JOIN models m              ON m.model_id     = ta.model_id
+            LEFT JOIN benchmarks b          ON b.benchmark_id = ta.benchmark_id
+            LEFT JOIN benchmark_categories bc ON bc.benchmark_id = ta.benchmark_id
+            LEFT JOIN canonical_metrics cmet ON cmet.id       = ta.metric_id
+        ),
+        ranked AS (
+            -- Rank by score within (benchmark_id, metric_id), honouring
+            -- lower_is_better. NULL scores sort last and get position=NULL.
+            -- COUNT(rep_score) over the partition counts non-NULL scores.
+            SELECT *,
+                CASE
+                    WHEN rep_score IS NULL THEN NULL
+                    ELSE CAST(ROW_NUMBER() OVER (
+                        PARTITION BY benchmark_id, metric_id
+                        ORDER BY
+                            CASE WHEN rep_score IS NULL THEN 1 ELSE 0 END ASC,
+                            CASE WHEN COALESCE(rep_lower_is_better, FALSE)
+                                 THEN rep_score
+                                 ELSE -rep_score
+                            END ASC,
+                            model_id ASC
+                    ) AS INTEGER)
+                END AS position,
+                CAST(COUNT(rep_score) OVER (
+                    PARTITION BY benchmark_id, metric_id
+                ) AS INTEGER) AS total
+            FROM joined
+        )
+        SELECT
+            TIMESTAMP '{sid}' AS snapshot_id,
+            url_encode_udf(benchmark_id)                         AS evaluation_id,
+            metric_summary_id_udf(benchmark_id, metric_id)       AS metric_summary_id,
+            benchmark_id,
+            metric_id,
+            model_id,
+            url_encode_udf(model_id)                             AS model_route_id,
+
+            -- model_info: denormalised display context
+            CAST({{
+                'name':              COALESCE(m_display_name, rep_model_raw),
+                'id':                model_id,
+                'developer':         COALESCE(m_org_display_name, m_developer),
+                'inference_platform': NULL,
+                'inference_engine':   NULL,
+                'model_version':     NULL,
+                'architecture':      m_architecture,
+                'parameter_count':   CASE WHEN m_params_billions IS NOT NULL
+                                          THEN CAST(m_params_billions AS VARCHAR) || 'B'
+                                          ELSE NULL END,
+                'release_date':      m_release_date,
+                'model_url':         NULL,
+                'open_weights':      m_open_weights
+            }} AS STRUCT(
+                name VARCHAR, id VARCHAR, developer VARCHAR,
+                inference_platform VARCHAR, inference_engine VARCHAR,
+                model_version VARCHAR, architecture VARCHAR,
+                parameter_count VARCHAR, release_date VARCHAR,
+                model_url VARCHAR,
+                open_weights BOOLEAN
+            )) AS model_info,
+
+            metric_display_name,
+            rep_metric_unit                                       AS metric_unit,
+            rep_lower_is_better                                   AS lower_is_better,
+            b_category                                            AS category,
+
+            rep_score                                             AS score,
+            CAST({{
+                'score':             rep_score,
+                'standard_error':    rep_score_se,
+                'sample_size':       rep_n_samples,
+                'confidence_interval': {{
+                    'lower':             rep_ci_lower,
+                    'upper':             rep_ci_upper,
+                    'confidence_level':  rep_ci_level
+                }}
+            }} AS STRUCT(
+                score DOUBLE, standard_error DOUBLE, sample_size INTEGER,
+                confidence_interval STRUCT(
+                    lower DOUBLE, upper DOUBLE, confidence_level DOUBLE
+                )
+            )) AS score_details,
+            fact_row_count,
+
+            position,
+            total,
+            CASE
+                WHEN total IS NULL OR total <= 1 OR position IS NULL THEN NULL
+                ELSE 1.0 - (position - 1.0) / (total - 1.0)
+            END AS percentile,
+
+            -- TRY_CAST so a malformed timestamp string yields NULL instead of erroring
+            -- the whole snapshot. fact_results carries retrieved_timestamp as VARCHAR
+            -- (EEE schema declares it `format: date-time` over `type: string`).
+            TRY_CAST(rep_retrieved_timestamp AS TIMESTAMP)        AS evaluation_timestamp,
+
+            CAST({{
+                'source_name':              rep_org_raw,
+                'source_type':              rep_source_type,
+                'source_organization_name': rep_org_raw,
+                'source_organization_url':  rep_source_org_url,
+                'evaluator_relationship':   rep_evaluator_relationship,
+                'source_url':               NULL,
+                'publication_date':         NULL
+            }} AS STRUCT(
+                source_name VARCHAR, source_type VARCHAR,
+                source_organization_name VARCHAR, source_organization_url VARCHAR,
+                evaluator_relationship VARCHAR, source_url VARCHAR,
+                publication_date DATE
+            )) AS source_metadata,
+
+            -- source_data is producer-NULL today: EEE evaluation_results[].source_data
+            -- isn't carried onto fact_results. STRUCT shape preserved for the consumer.
+            CAST({{
+                'dataset_name':    NULL,
+                'source_type':     NULL,
+                'hf_repo':         NULL,
+                'hf_split':        NULL,
+                'samples_number':  NULL,
+                'url':             NULL,
+                'dataset_url':     NULL,
+                'dataset_version': NULL
+            }} AS STRUCT(
+                dataset_name VARCHAR, source_type VARCHAR, hf_repo VARCHAR,
+                hf_split VARCHAR, samples_number INTEGER, url VARCHAR[],
+                dataset_url VARCHAR, dataset_version VARCHAR
+            )) AS source_data,
+
+            CAST(NULL AS VARCHAR) AS source_record_url,
+
+            CAST({{
+                'name':    rep_eval_library_name,
+                'version': rep_eval_library_version,
+                'fork':    NULL
+            }} AS STRUCT(name VARCHAR, version VARCHAR, fork VARCHAR)) AS eval_library,
+
+            evaluator_relationships,
+            has_first_party,
+            has_third_party,
+            CASE
+                WHEN has_first_party AND has_third_party THEN 'both'
+                WHEN has_first_party                     THEN 'self'
+                ELSE                                          'third'
+            END AS coverage_cell,
+            reporting_orgs,
+            scores_by_organization,
+
+            is_summary_score_udf(metric_id, rep_parent_benchmark_id, benchmark_id)
+                AS is_summary_score,
+            rep_parent_benchmark_id AS summary_score_for,
+            CAST(NULL AS {aggregate_components_type}) AS aggregate_components,
+
+            triple_has_repro_gap        AS has_reproducibility_gap,
+            triple_avg_completeness     AS completeness_score,
+            is_multi_source,
+            first_party_only,
+            has_variant_divergence,
+            has_cross_party_divergence,
+
+            CAST({{
+                'reproducibility_gap': {{
+                    'missing_fields':  rep_repro_missing_fields,
+                    'populated_count': rep_repro_populated_count,
+                    'required_count':  rep_repro_required_count
+                }},
+                'provenance': {{
+                    'source_type':            rep_provenance_source_type,
+                    'evaluator_relationship': rep_evaluator_relationship,
+                    'organization_name':      rep_org_raw
+                }},
+                'variant_divergence': {{
+                    'magnitude':        variant_divergence_magnitude,
+                    'threshold':        variant_divergence_threshold,
+                    'basis':            variant_threshold_basis,
+                    'differing_fields': variant_differing_fields
+                }},
+                'cross_party_divergence': {{
+                    'magnitude':          cross_party_divergence_magnitude,
+                    'threshold':          cross_party_divergence_threshold,
+                    'basis':              cross_party_threshold_basis,
+                    'differing_fields':   cross_party_differing_fields,
+                    'organization_count': cross_party_org_count
+                }}
+            }} AS {eval_annotation_struct_type}) AS evalcards_annotations,
+
+            rep_instance_file_path   AS instance_file_path,
+            rep_instance_file_format AS instance_file_format,
+            rep_instance_rows        AS instance_rows
+        FROM ranked
+        ORDER BY metric_summary_id, model_id
+        """
+    )
+
+
+def stage_j_models_view(con, snapshot_id: str) -> None:
+    """Materialise `models_view` — one row per model.
+
+    Aggregates the model's fact rows (evidence_count, variant_count,
+    timestamps, evaluator/source breakdowns) and per-triple data from
+    `eval_results_view` (evaluations_count, signal rollups, category
+    breakdown, top scores). Joins onto `models` for display fields.
+
+    Depends on `eval_results_view` already being materialised on the
+    connection by `stage_j_eval_results_view`.
+
+    `variants[]` is single-self for v1 (one entry per row, the row's own
+    model). Family-scoped variant rollup is a follow-up — today's
+    registry doesn't carry the variant metadata (qualifier/version_date)
+    that would let us populate other family members usefully.
+    """
+    sid = snapshot_id_to_sql(snapshot_id)
+
+    con.execute(
+        f"""
+        CREATE TABLE models_view AS
+        WITH fact_aggs AS (
+            -- Per-fact-row rollups: evidence_count, variant_count_setup,
+            -- generation-config gaps, latest timestamp, evaluator names.
+            SELECT
+                model_id,
+                CAST(COUNT(*) AS BIGINT)                    AS evidence_count,
+                CAST(COUNT(DISTINCT variant_key) AS INTEGER) AS variant_count,
+                CAST(COUNT(*) FILTER (
+                    WHERE NOT (has_temperature AND has_top_p AND has_max_tokens)
+                ) AS INTEGER)                                AS missing_generation_config_count,
+                MAX(TRY_CAST(retrieved_timestamp AS TIMESTAMP)) AS latest_timestamp,
+                arg_max(org_raw, TRY_CAST(retrieved_timestamp AS TIMESTAMP))
+                    FILTER (WHERE org_raw IS NOT NULL)        AS latest_source_name,
+                CAST(COUNT(DISTINCT org_id) FILTER (WHERE org_id IS NOT NULL) AS BIGINT)
+                                                              AS evaluator_count,
+                ARRAY_AGG(DISTINCT org_raw)
+                    FILTER (WHERE org_raw IS NOT NULL)        AS evaluator_names,
+                CAST(COUNT(DISTINCT provenance_source_type)
+                     FILTER (WHERE provenance_source_type IS NOT NULL) AS INTEGER)
+                                                              AS source_type_count,
+                ARRAY_AGG(DISTINCT provenance_source_type)
+                    FILTER (WHERE provenance_source_type IS NOT NULL) AS source_types,
+                ARRAY_AGG(DISTINCT model_raw)
+                    FILTER (WHERE model_raw IS NOT NULL)      AS raw_model_ids,
+                ARRAY_AGG(DISTINCT struct_pack(
+                    "name"    := eval_library_name,
+                    "version" := eval_library_version,
+                    fork      := CAST(NULL AS VARCHAR)
+                )) FILTER (
+                    WHERE eval_library_name IS NOT NULL
+                       OR eval_library_version IS NOT NULL
+                )                                             AS eval_libraries
+            FROM fact_results
+            WHERE model_id IS NOT NULL
+            GROUP BY 1
+        ),
+        triple_aggs AS (
+            -- Per-triple rollups read from eval_results_view (one row per
+            -- triple already). Counts of (benchmark_id, metric_id) cells,
+            -- third-party coverage, signal flags, score summary, category
+            -- breakdown.
+            SELECT
+                model_id,
+                CAST(COUNT(*) AS BIGINT)                                  AS evaluations_count,
+                CAST(COUNT(DISTINCT benchmark_id) AS BIGINT)              AS benchmarks_count,
+                CAST(COUNT(*) FILTER (WHERE coverage_cell IN ('third', 'both')) AS BIGINT)
+                                                                          AS third_party_eval_count,
+                AVG(CASE WHEN has_reproducibility_gap THEN 1.0 ELSE 0.0 END)
+                                                                          AS gap_rate,
+                CAST(SUM(CASE WHEN has_reproducibility_gap THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS gap_count,
+                AVG(completeness_score)                                   AS completeness_avg,
+                ARRAY_AGG(DISTINCT category)
+                    FILTER (WHERE category IS NOT NULL)                   AS categories_present,
+                CAST(SUM(CASE WHEN category = 'General'   THEN 1 ELSE 0 END) AS INTEGER) AS cat_general,
+                CAST(SUM(CASE WHEN category = 'Reasoning' THEN 1 ELSE 0 END) AS INTEGER) AS cat_reasoning,
+                CAST(SUM(CASE WHEN category = 'Agentic'   THEN 1 ELSE 0 END) AS INTEGER) AS cat_agentic,
+                CAST(SUM(CASE WHEN category = 'Safety'    THEN 1 ELSE 0 END) AS INTEGER) AS cat_safety,
+                CAST(SUM(CASE WHEN category = 'Knowledge' THEN 1 ELSE 0 END) AS INTEGER) AS cat_knowledge,
+                CAST(COUNT(score) AS INTEGER)                             AS score_count,
+                MIN(score)                                                AS score_min,
+                MAX(score)                                                AS score_max,
+                AVG(score)                                                AS score_avg,
+                CAST(SUM(CASE WHEN is_multi_source THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS multi_source_groups,
+                CAST(SUM(CASE WHEN first_party_only THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS first_party_only_groups,
+                CAST(SUM(CASE WHEN has_variant_divergence THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS variant_divergent_count,
+                CAST(SUM(CASE WHEN has_cross_party_divergence THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS cross_party_divergent_count,
+                CAST(SUM(CASE WHEN has_variant_divergence IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS groups_with_variant_check,
+                CAST(SUM(CASE WHEN has_cross_party_divergence IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER)
+                                                                          AS groups_with_cross_party_check,
+                {_source_type_distribution_sql("eval_results_view")}
+            FROM eval_results_view
+            GROUP BY 1
+        ),
+        benchmark_names AS (
+            SELECT
+                erv.model_id,
+                ARRAY_AGG(DISTINCT b.display_name)
+                    FILTER (WHERE b.display_name IS NOT NULL) AS benchmark_names
+            FROM eval_results_view erv
+            LEFT JOIN benchmarks b ON b.benchmark_id = erv.benchmark_id
+            GROUP BY 1
+        ),
+        ranked_for_top AS (
+            -- For each (model, category), rank rows by score (lower_is_better aware).
+            SELECT
+                erv.model_id,
+                erv.category,
+                COALESCE(b.display_name, erv.benchmark_id) AS benchmark_display,
+                erv.evaluation_id                          AS benchmark_key,
+                erv.score,
+                erv.metric_display_name,
+                ROW_NUMBER() OVER (
+                    PARTITION BY erv.model_id, erv.category
+                    ORDER BY
+                        CASE WHEN COALESCE(erv.lower_is_better, FALSE)
+                             THEN erv.score ELSE -erv.score
+                        END ASC,
+                        erv.evaluation_id ASC
+                ) AS _rk
+            FROM eval_results_view erv
+            LEFT JOIN benchmarks b ON b.benchmark_id = erv.benchmark_id
+            WHERE erv.score IS NOT NULL
+              AND erv.category IS NOT NULL
+        ),
+        top_scores AS (
+            SELECT
+                model_id,
+                ARRAY_AGG(struct_pack(
+                    benchmark    := benchmark_display,
+                    benchmarkKey := benchmark_key,
+                    score        := score,
+                    metric       := metric_display_name
+                ) ORDER BY category) AS top_scores
+            FROM ranked_for_top
+            WHERE _rk = 1
+            GROUP BY 1
+        ),
+        link_rollups AS (
+            SELECT
+                model_id,
+                ARRAY_AGG(DISTINCT source_metadata.source_organization_url)
+                    FILTER (WHERE source_metadata.source_organization_url IS NOT NULL)
+                    AS source_urls
+            FROM eval_results_view
+            GROUP BY 1
+        )
+        SELECT
+            TIMESTAMP '{sid}' AS snapshot_id,
+            m.model_id,
+            m.model_id                                  AS id,
+            url_encode_udf(m.model_id)                  AS route_id,
+            url_encode_udf(m.model_id)                  AS model_route_id,
+            COALESCE(m.parent_model_id, m.model_id)     AS model_family_id,
+
+            m.display_name                              AS model_name,
+            m.display_name                              AS canonical_model_name,
+            m.family                                    AS model_family_name,
+            COALESCE(m.org_display_name, m.developer)   AS developer,
+
+            m.release_date                              AS release_date,
+            CAST(NULL AS VARCHAR)                       AS model_url,
+            m.architecture,
+            CAST(NULL AS VARCHAR)                       AS params,
+            m.params_billions,
+            m.open_weights                              AS open_weights,
+            m.root_model_id                             AS root_model_id,
+            m.lineage_origin_org_id                     AS lineage_origin_org_id,
+            CAST(NULL AS VARCHAR)                       AS inference_engine,
+            CAST(NULL AS VARCHAR)                       AS inference_platform,
+
+            COALESCE(ta.evaluations_count, 0)           AS evaluations_count,
+            COALESCE(ta.benchmarks_count,  0)           AS benchmarks_count,
+            COALESCE(fa.variant_count,     0)           AS variant_count,
+            COALESCE(fa.evaluator_count,   0)           AS evaluator_count,
+            fa.evaluator_names,
+            COALESCE(fa.source_type_count, 0)           AS source_type_count,
+            fa.source_types,
+            COALESCE(ta.third_party_eval_count, 0)      AS third_party_eval_count,
+            CASE
+                WHEN COALESCE(ta.evaluations_count, 0) > 0
+                THEN CAST(ta.third_party_eval_count AS DOUBLE) / ta.evaluations_count
+                ELSE NULL
+            END                                          AS independent_verification_ratio,
+            COALESCE(fa.evidence_count, 0)               AS evidence_count,
+            COALESCE(fa.missing_generation_config_count, 0) AS missing_generation_config_count,
+            fa.latest_timestamp,
+            fa.latest_source_name,
+            bn.benchmark_names,
+
+            ta.categories_present                        AS categories,
+            CAST({{
+                'General':   COALESCE(ta.cat_general,   0),
+                'Reasoning': COALESCE(ta.cat_reasoning, 0),
+                'Agentic':   COALESCE(ta.cat_agentic,   0),
+                'Safety':    COALESCE(ta.cat_safety,    0),
+                'Knowledge': COALESCE(ta.cat_knowledge, 0)
+            }} AS STRUCT(
+                "General" INTEGER, "Reasoning" INTEGER, "Agentic" INTEGER,
+                "Safety" INTEGER, "Knowledge" INTEGER
+            )) AS category_stats,
+
+            -- reproducibility band rule (legacy: 0/1/0<x<1 → complete/missing/partial)
+            CASE
+                WHEN ta.gap_rate IS NULL THEN NULL
+                WHEN ta.gap_rate = 0     THEN 'complete'
+                WHEN ta.gap_rate = 1     THEN 'missing'
+                ELSE                          'partial'
+            END                                          AS reproducibility_status,
+            CAST({{
+                'results_total':                CAST(COALESCE(ta.evaluations_count, 0) AS INTEGER),
+                'has_reproducibility_gap_count': COALESCE(ta.gap_count, 0),
+                'populated_ratio_avg':           ta.completeness_avg
+            }} AS {_REPRODUCIBILITY_SUMMARY_STRUCT}) AS reproducibility_summary,
+
+            CAST({{
+                'total_results':           CAST(COALESCE(fa.evidence_count, 0) AS INTEGER),
+                'total_groups':            CAST(COALESCE(ta.evaluations_count, 0) AS INTEGER),
+                'multi_source_groups':     COALESCE(ta.multi_source_groups, 0),
+                'first_party_only_groups': COALESCE(ta.first_party_only_groups, 0),
+                'source_type_distribution': {{
+                    'first_party':   COALESCE(ta.pst_first_party,   0),
+                    'third_party':   COALESCE(ta.pst_third_party,   0),
+                    'collaborative': COALESCE(ta.pst_collaborative, 0),
+                    'unspecified':   COALESCE(ta.pst_unspecified,   0)
+                }}
+            }} AS {_PROVENANCE_SUMMARY_STRUCT}) AS provenance_summary,
+
+            CAST({{
+                'total_groups':                  CAST(COALESCE(ta.evaluations_count, 0) AS INTEGER),
+                'groups_with_variant_check':     COALESCE(ta.groups_with_variant_check, 0),
+                'groups_with_cross_party_check': COALESCE(ta.groups_with_cross_party_check, 0),
+                'variant_divergent_count':       COALESCE(ta.variant_divergent_count, 0),
+                'cross_party_divergent_count':   COALESCE(ta.cross_party_divergent_count, 0)
+            }} AS {_COMPARABILITY_SUMMARY_STRUCT}) AS comparability_summary,
+
+            fa.eval_libraries,
+
+            CAST({{
+                'count':   COALESCE(ta.score_count, 0),
+                'min':     ta.score_min,
+                'max':     ta.score_max,
+                'average': ta.score_avg
+            }} AS STRUCT(
+                "count" INTEGER, "min" DOUBLE, "max" DOUBLE, average DOUBLE
+            )) AS score_summary,
+
+            ts.top_scores,
+
+            lr.source_urls,
+            CAST([] AS VARCHAR[])                        AS detail_urls,
+
+            -- variants[]: single self-entry for v1 — see function docstring.
+            [CAST({{
+                'variant_id':           m.model_id,
+                'variant_key':          url_encode_udf(m.model_id),
+                'variant_label':        m.display_name,
+                'variant_display_name': m.display_name,
+                'raw_model_ids':        fa.raw_model_ids,
+                'family_id':            COALESCE(m.parent_model_id, m.model_id),
+                'family_name':          m.family,
+                'version_date':         CAST(NULL AS VARCHAR),
+                'version_qualifier':    CAST(NULL AS VARCHAR),
+                'total_evaluations':    CAST(COALESCE(ta.evaluations_count, 0) AS INTEGER),
+                'last_updated':         fa.latest_timestamp,
+                'categories_covered':   ta.categories_present
+            }} AS STRUCT(
+                variant_id VARCHAR, variant_key VARCHAR,
+                variant_label VARCHAR, variant_display_name VARCHAR,
+                raw_model_ids VARCHAR[], family_id VARCHAR, family_name VARCHAR,
+                version_date VARCHAR, version_qualifier VARCHAR,
+                total_evaluations INTEGER, last_updated TIMESTAMP,
+                categories_covered VARCHAR[]
+            ))]                                          AS variants,
+
+            fa.raw_model_ids
+        FROM models m
+        LEFT JOIN fact_aggs    fa ON fa.model_id = m.model_id
+        LEFT JOIN triple_aggs  ta ON ta.model_id = m.model_id
+        LEFT JOIN benchmark_names bn ON bn.model_id = m.model_id
+        LEFT JOIN top_scores   ts ON ts.model_id = m.model_id
+        LEFT JOIN link_rollups lr ON lr.model_id = m.model_id
+        ORDER BY m.model_id
+        """
+    )
+
+
+def stage_j_evals_view(con, snapshot_id: str) -> None:
+    """Materialise `evals_view` — one row per benchmark.
+
+    Carries the primary metric's config + scalars plus the multi-metric
+    pre-pivoted leaderboard (`leaderboard_metrics[]` columns, one
+    `leaderboard_rows[]` entry per model with a `values` MAP keyed by
+    metric `column_key`). The frontend's eval detail page renders multi-
+    metric directly off these arrays — no per-page GROUP BY.
+
+    `primary_metric_id` heuristic: metric with the most distinct models;
+    tie-break on metric_id ASC. The benchmark-level scalars (`avg_score`,
+    `top_score`, `best_model`) are scoped to that primary metric.
+
+    Depends on `eval_results_view` already being materialised on the
+    connection.
+
+    `subtasks[]` is empty in v1 — fact_results doesn't carry a slice_key
+    today. Same for `aggregate_sources[]` (suite rollup is not yet
+    tracked) and `is_aggregated` (always false).
+    """
+    sid = snapshot_id_to_sql(snapshot_id)
+
+    benchmark_card_struct_type = (
+        "STRUCT("
+        "benchmark_details STRUCT("
+        '  "name" VARCHAR, overview VARCHAR, data_type VARCHAR,'
+        "  domains VARCHAR[], languages VARCHAR[],"
+        "  similar_benchmarks VARCHAR[], resources VARCHAR[]"
+        "),"
+        "purpose_and_intended_users STRUCT("
+        "  goal VARCHAR, audience VARCHAR[], tasks VARCHAR[],"
+        "  limitations VARCHAR, out_of_scope_uses VARCHAR[]"
+        "),"
+        "data STRUCT(source VARCHAR, size VARCHAR, format VARCHAR, annotation VARCHAR),"
+        "methodology STRUCT("
+        "  methods VARCHAR[], metrics VARCHAR[], calculation VARCHAR,"
+        "  interpretation VARCHAR, baseline_results VARCHAR, validation VARCHAR"
+        "),"
+        "ethical_and_legal_considerations STRUCT("
+        "  privacy_and_anonymity VARCHAR, data_licensing VARCHAR,"
+        "  consent_procedures VARCHAR, compliance_with_regulations VARCHAR"
+        "),"
+        "possible_risks STRUCT(category VARCHAR, description VARCHAR[], url VARCHAR)[],"
+        "flagged_fields JSON,"
+        "missing_fields VARCHAR[],"
+        "card_info STRUCT(created_at VARCHAR, llm VARCHAR)"
+        ")"
+    )
+
+    leaderboard_metric_struct_type = (
+        "STRUCT("
+        "column_key VARCHAR, metric_summary_id VARCHAR,"
+        "metric_id VARCHAR, metric_name VARCHAR, display_name VARCHAR,"
+        "canonical_display_name VARCHAR, lower_is_better BOOLEAN,"
+        "unit VARCHAR, scope VARCHAR, subtask_key VARCHAR, subtask_name VARCHAR"
+        ")"
+    )
+
+    source_data_struct_type = (
+        "STRUCT("
+        "dataset_name VARCHAR, source_type VARCHAR, hf_repo VARCHAR,"
+        "hf_split VARCHAR, samples_number INTEGER, url VARCHAR[],"
+        "dataset_url VARCHAR, dataset_version VARCHAR"
+        ")"
+    )
+
+    con.execute(
+        f"""
+        CREATE TABLE evals_view AS
+        WITH per_metric AS (
+            -- One row per (benchmark_id, metric_id). Carries metric meta + counts
+            -- + lower_is_better-aware top score in a single scan of
+            -- eval_results_view (vs a separate per_metric_top pass).
+            SELECT
+                erv.benchmark_id,
+                erv.metric_id,
+                ANY_VALUE(erv.metric_display_name) AS metric_display_name,
+                ANY_VALUE(erv.metric_unit)         AS metric_unit,
+                ANY_VALUE(erv.lower_is_better)     AS lower_is_better,
+                COUNT(DISTINCT erv.model_id)       AS metric_models_count,
+                CASE WHEN COALESCE(ANY_VALUE(erv.lower_is_better), FALSE)
+                     THEN MIN(erv.score) ELSE MAX(erv.score) END AS top_score
+            FROM eval_results_view erv
+            GROUP BY 1, 2
+        ),
+        primary_metric AS (
+            -- Pick one metric per benchmark: most-covered (tie-break on metric_id).
+            SELECT benchmark_id, metric_id, metric_display_name,
+                   metric_unit, lower_is_better, top_score
+            FROM (
+                SELECT pm.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY benchmark_id
+                           ORDER BY metric_models_count DESC, metric_id ASC
+                       ) AS _rk
+                FROM per_metric pm
+            )
+            WHERE _rk = 1
+        ),
+        primary_triples AS (
+            -- One row per triple on the primary metric. The
+            -- `scoring_score` flips sign for lower-is-better metrics so
+            -- arg_max/arg_min pick the right model in primary_facts.
+            SELECT
+                erv.*,
+                CASE WHEN COALESCE(pm.lower_is_better, FALSE)
+                     THEN -erv.score ELSE erv.score
+                END AS scoring_score
+            FROM eval_results_view erv
+            JOIN primary_metric pm
+              ON pm.benchmark_id = erv.benchmark_id
+             AND pm.metric_id    = erv.metric_id
+        ),
+        evaluator_names_agg AS (
+            -- Distinct org names across primary-metric triples for this benchmark.
+            -- Done in a separate CTE so the unnest doesn't inflate the per-triple
+            -- aggregations in `primary_facts`.
+            SELECT pt.benchmark_id,
+                   ARRAY_AGG(DISTINCT u) FILTER (WHERE u IS NOT NULL) AS evaluator_names
+            FROM primary_triples pt,
+                 UNNEST(COALESCE(pt.reporting_orgs, [])) AS u_t(u)
+            GROUP BY 1
+        ),
+        source_types_agg AS (
+            SELECT pt.benchmark_id,
+                   ARRAY_AGG(DISTINCT t) FILTER (WHERE t IS NOT NULL) AS source_types
+            FROM primary_triples pt,
+                 UNNEST(COALESCE(pt.evaluator_relationships, [])) AS t_t(t)
+            GROUP BY 1
+        ),
+        primary_facts AS (
+            -- Per-benchmark scalars over the primary metric's triples.
+            -- One row per triple — no cross-join unnest here, so SUMs and
+            -- COUNTs are accurate.
+            SELECT
+                pt.benchmark_id,
+                CAST(COUNT(DISTINCT pt.model_id) AS BIGINT)            AS models_count,
+                arg_max(pt.source_metadata.source_organization_name,
+                        pt.evaluation_timestamp)                       AS latest_source_name,
+                AVG(CASE WHEN pt.coverage_cell IN ('third', 'both')
+                         THEN 1.0 ELSE 0.0 END)                        AS third_party_ratio,
+                CAST(SUM(CASE
+                    WHEN pt.evalcards_annotations.reproducibility_gap.populated_count
+                       < pt.evalcards_annotations.reproducibility_gap.required_count
+                    THEN 1 ELSE 0 END) AS INTEGER)                     AS missing_generation_config_count,
+                AVG(pt.score)                                          AS avg_score,
+                MIN(pt.score)                                          AS min_score_seen,
+                MAX(pt.score)                                          AS max_score_seen,
+                arg_max(pt.model_id, pt.scoring_score)                 AS top_model_id,
+                arg_min(pt.model_id, pt.scoring_score)                 AS bottom_model_id,
+                AVG(CASE WHEN pt.has_reproducibility_gap THEN 1.0 ELSE 0.0 END)
+                                                                       AS gap_rate,
+                CAST(SUM(CASE WHEN pt.has_reproducibility_gap THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS gap_count,
+                AVG(pt.completeness_score)                             AS completeness_avg,
+                CAST(COUNT(*) AS INTEGER)                              AS gprov_total_groups,
+                CAST(SUM(CASE WHEN pt.is_multi_source THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS multi_source_groups,
+                CAST(SUM(CASE WHEN pt.first_party_only THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS first_party_only_groups,
+                {_source_type_distribution_sql("pt")},
+                CAST(SUM(CASE WHEN pt.has_variant_divergence THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS variant_divergent_count,
+                CAST(SUM(CASE WHEN pt.has_cross_party_divergence THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS cross_party_divergent_count,
+                CAST(SUM(CASE WHEN pt.has_variant_divergence IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS groups_with_variant_check,
+                CAST(SUM(CASE WHEN pt.has_cross_party_divergence IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER)
+                                                                       AS groups_with_cross_party_check
+            FROM primary_triples pt
+            GROUP BY pt.benchmark_id
+        ),
+        leaderboard_metrics_agg AS (
+            SELECT
+                pm.benchmark_id,
+                CAST(COUNT(*) AS INTEGER) AS metrics_count,
+                ARRAY_AGG(pm.metric_display_name ORDER BY pm.metric_id)
+                    AS metric_names,
+                ARRAY_AGG(struct_pack(
+                    column_key             := pm.metric_id,
+                    metric_summary_id      := metric_summary_id_udf(
+                                                  pm.benchmark_id, pm.metric_id),
+                    metric_id              := pm.metric_id,
+                    metric_name            := pm.metric_display_name,
+                    display_name           := pm.metric_display_name,
+                    canonical_display_name := pm.metric_display_name,
+                    lower_is_better        := pm.lower_is_better,
+                    unit                   := pm.metric_unit,
+                    scope                  := 'root',
+                    subtask_key            := CAST(NULL AS VARCHAR),
+                    subtask_name           := CAST(NULL AS VARCHAR)
+                ) ORDER BY pm.metric_id) AS leaderboard_metrics,
+                ARRAY_AGG(struct_pack(
+                    metric_summary_id      := metric_summary_id_udf(
+                                                  pm.benchmark_id, pm.metric_id),
+                    metric_name            := pm.metric_display_name,
+                    display_name           := pm.metric_display_name,
+                    canonical_display_name := pm.metric_display_name,
+                    metric_key             := pm.metric_id,
+                    lower_is_better        := pm.lower_is_better,
+                    models_count           := CAST(pm.metric_models_count AS INTEGER),
+                    top_score              := pm.top_score,
+                    unit                   := pm.metric_unit
+                ) ORDER BY pm.metric_id) AS root_metrics
+            FROM per_metric pm
+            GROUP BY pm.benchmark_id
+        ),
+        leaderboard_per_model AS (
+            -- One row per (benchmark_id, model_id) carrying its values map across
+            -- all metrics on that benchmark.
+            SELECT
+                erv.benchmark_id,
+                erv.model_id,
+                ANY_VALUE(erv.model_route_id)                  AS model_route_id,
+                ANY_VALUE(erv.model_info)                      AS model_info,
+                ANY_VALUE(erv.evaluation_timestamp)            AS evaluation_timestamp,
+                ANY_VALUE(erv.source_metadata)                 AS source_metadata,
+                ANY_VALUE(erv.source_data)                     AS source_data,
+                MAP(
+                    ARRAY_AGG(erv.metric_id ORDER BY erv.metric_id),
+                    ARRAY_AGG(erv.score     ORDER BY erv.metric_id)
+                )                                              AS values_map,
+                CAST(COUNT(erv.score) AS INTEGER)              AS metrics_present
+            FROM eval_results_view erv
+            GROUP BY 1, 2
+        ),
+        leaderboard_rows_agg AS (
+            SELECT
+                benchmark_id,
+                ARRAY_AGG(struct_pack(
+                    model_info           := model_info,
+                    model_route_id       := model_route_id,
+                    evaluation_timestamp := evaluation_timestamp,
+                    source_metadata      := source_metadata,
+                    source_data          := source_data,
+                    "values"             := values_map,
+                    metrics_present      := metrics_present
+                ) ORDER BY model_id) AS leaderboard_rows
+            FROM leaderboard_per_model
+            GROUP BY 1
+        ),
+        instance_summary AS (
+            SELECT
+                erv.benchmark_id,
+                CAST(COUNT(DISTINCT erv.instance_file_path)
+                     FILTER (WHERE erv.instance_file_path IS NOT NULL) AS BIGINT)
+                    AS url_count,
+                ARRAY_AGG(DISTINCT erv.instance_file_path
+                          ORDER BY erv.instance_file_path)
+                    FILTER (WHERE erv.instance_file_path IS NOT NULL)
+                    AS sample_urls_full,
+                CAST(COUNT(DISTINCT erv.model_id)
+                     FILTER (WHERE erv.instance_file_path IS NOT NULL) AS INTEGER)
+                    AS models_with_loaded_instances
+            FROM eval_results_view erv
+            GROUP BY 1
+        )
+        SELECT
+            TIMESTAMP '{sid}' AS snapshot_id,
+            url_encode_udf(b.benchmark_id)              AS evaluation_id,
+            b.benchmark_id,
+            pm.metric_id                                AS primary_metric_id,
+
+            b.display_name                              AS evaluation_name,
+            b.display_name                              AS canonical_display_name,
+            COALESCE(b.parent_benchmark_id, b.benchmark_id) AS composite_benchmark_key,
+            b.display_name                              AS composite_benchmark_name,
+            COALESCE(b.parent_benchmark_id, b.benchmark_id) AS benchmark_family_key,
+            CASE WHEN b.parent_benchmark_id IS NOT NULL
+                 THEN b.benchmark_id ELSE NULL END      AS benchmark_leaf_key,
+            categorise_benchmark_udf(b.domains, b.tasks, b.registry_tags) AS category,
+
+            CAST(struct_pack(
+                evaluation_description := pm.metric_display_name,
+                lower_is_better        := pm.lower_is_better,
+                score_type             := CAST(NULL AS VARCHAR),
+                min_score              := cmet.min_score,
+                max_score              := cmet.max_score,
+                unit                   := pm.metric_unit
+            ) AS STRUCT(
+                evaluation_description VARCHAR, lower_is_better BOOLEAN,
+                score_type VARCHAR, min_score DOUBLE, max_score DOUBLE,
+                unit VARCHAR
+            )) AS metric_config,
+
+            COALESCE(pf.models_count, 0)                AS models_count,
+            ena.evaluator_names,
+            sta.source_types,
+            pf.latest_source_name,
+            pf.third_party_ratio,
+            pf.missing_generation_config_count,
+            CAST(struct_pack(
+                "name" := COALESCE(top_m.display_name, pf.top_model_id),
+                score  := pm.top_score
+            ) AS STRUCT("name" VARCHAR, score DOUBLE)) AS best_model,
+            CAST(struct_pack(
+                "name" := COALESCE(bot_m.display_name, pf.bottom_model_id),
+                score  := CASE WHEN COALESCE(pm.lower_is_better, FALSE)
+                               THEN pf.max_score_seen ELSE pf.min_score_seen END
+            ) AS STRUCT("name" VARCHAR, score DOUBLE)) AS worst_model,
+            pf.avg_score,
+            CASE
+                WHEN cmet.min_score IS NULL OR cmet.max_score IS NULL
+                  OR cmet.max_score = cmet.min_score THEN NULL
+                ELSE (pf.avg_score - cmet.min_score) / (cmet.max_score - cmet.min_score)
+            END                                          AS avg_score_norm,
+            pm.top_score                                 AS top_score,
+
+            COALESCE(b.card_present, FALSE)              AS has_card,
+            CAST(struct_pack(
+                benchmark_details := struct_pack(
+                    "name"    := b.card_name,
+                    overview  := b.overview,
+                    data_type := b.data_type,
+                    domains   := b.domains,
+                    languages := b.languages,
+                    similar_benchmarks := b.similar_benchmarks,
+                    resources := b.resources
+                ),
+                purpose_and_intended_users := struct_pack(
+                    goal              := b.goal,
+                    audience          := b.audience,
+                    tasks             := b.tasks,
+                    limitations       := b.limitations,
+                    out_of_scope_uses := b.out_of_scope_uses
+                ),
+                data := struct_pack(
+                    source     := b.data_source,
+                    size       := b.data_size,
+                    format     := b.data_format,
+                    annotation := b.data_annotation
+                ),
+                methodology := struct_pack(
+                    methods          := b.methods,
+                    metrics          := b.card_metrics,
+                    calculation      := b.calculation,
+                    interpretation   := b.interpretation,
+                    baseline_results := b.baseline_results,
+                    validation       := b.validation
+                ),
+                ethical_and_legal_considerations := struct_pack(
+                    privacy_and_anonymity        := b.privacy_and_anonymity,
+                    data_licensing               := b.data_licensing,
+                    consent_procedures           := b.consent_procedures,
+                    compliance_with_regulations  := b.compliance_with_regulations
+                ),
+                possible_risks := b.possible_risks,
+                flagged_fields := b.flagged_fields,
+                missing_fields := CAST([] AS VARCHAR[]),
+                card_info := struct_pack(
+                    created_at := CAST(NULL AS VARCHAR),
+                    llm        := b.card_generated_by
+                )
+            ) AS {benchmark_card_struct_type})            AS benchmark_card,
+
+            FALSE                                         AS is_aggregated,
+            CAST(NULL AS STRUCT(
+                evaluation_id VARCHAR,
+                composite_benchmark_key VARCHAR,
+                composite_benchmark_name VARCHAR,
+                models_count INTEGER,
+                avg_score_norm DOUBLE
+            )[])                                          AS aggregate_sources,
+            is_summary_score_udf(
+                pm.metric_id, b.parent_benchmark_id, b.benchmark_id
+            )                                             AS is_summary_score,
+            CAST([] AS VARCHAR[])                         AS summary_eval_ids,
+
+            CAST(struct_pack(
+                domains   := b.domains,
+                languages := b.languages,
+                tasks     := b.tasks
+            ) AS STRUCT(
+                domains VARCHAR[], languages VARCHAR[], tasks VARCHAR[]
+            )) AS tags,
+            CAST(struct_pack(
+                dataset_name    := b.display_name,
+                source_type     := b.data_format,
+                hf_repo         := b.dataset_repo,
+                hf_split        := CAST(NULL AS VARCHAR),
+                samples_number  := CAST(NULL AS INTEGER),
+                url             := b.resources,
+                dataset_url     := CAST(NULL AS VARCHAR),
+                dataset_version := CAST(NULL AS VARCHAR)
+            ) AS {source_data_struct_type})              AS source_data,
+
+            CAST(struct_pack(
+                results_total                := COALESCE(pf.gprov_total_groups, 0),
+                has_reproducibility_gap_count := COALESCE(pf.gap_count, 0),
+                populated_ratio_avg          := pf.completeness_avg
+            ) AS {_REPRODUCIBILITY_SUMMARY_STRUCT}) AS reproducibility_summary,
+
+            CAST(struct_pack(
+                total_results            := COALESCE(pf.gprov_total_groups, 0),
+                total_groups             := COALESCE(pf.gprov_total_groups, 0),
+                multi_source_groups      := COALESCE(pf.multi_source_groups, 0),
+                first_party_only_groups  := COALESCE(pf.first_party_only_groups, 0),
+                source_type_distribution := struct_pack(
+                    first_party   := COALESCE(pf.pst_first_party, 0),
+                    third_party   := COALESCE(pf.pst_third_party, 0),
+                    collaborative := COALESCE(pf.pst_collaborative, 0),
+                    unspecified   := COALESCE(pf.pst_unspecified, 0)
+                )
+            ) AS {_PROVENANCE_SUMMARY_STRUCT}) AS provenance_summary,
+
+            CAST(struct_pack(
+                total_groups                  := COALESCE(pf.gprov_total_groups, 0),
+                groups_with_variant_check     := COALESCE(pf.groups_with_variant_check, 0),
+                groups_with_cross_party_check := COALESCE(pf.groups_with_cross_party_check, 0),
+                variant_divergent_count       := COALESCE(pf.variant_divergent_count, 0),
+                cross_party_divergent_count   := COALESCE(pf.cross_party_divergent_count, 0)
+            ) AS {_COMPARABILITY_SUMMARY_STRUCT}) AS comparability_summary,
+
+            CAST(struct_pack(
+                available                    := COALESCE(ins.url_count, 0) > 0,
+                url_count                    := COALESCE(ins.url_count, 0),
+                sample_urls                  := COALESCE(ins.sample_urls_full[1:5],
+                                                          CAST([] AS VARCHAR[])),
+                models_with_loaded_instances := COALESCE(ins.models_with_loaded_instances, 0)
+            ) AS STRUCT(
+                available BOOLEAN, url_count BIGINT,
+                sample_urls VARCHAR[], models_with_loaded_instances INTEGER
+            )) AS instance_data,
+
+            COALESCE(lma.metrics_count, 0)               AS metrics_count,
+            lma.metric_names,
+            CAST(COALESCE(
+                lma.leaderboard_metrics,
+                CAST([] AS {leaderboard_metric_struct_type}[])
+            ) AS {leaderboard_metric_struct_type}[]) AS leaderboard_metrics,
+            lra.leaderboard_rows,
+
+            lma.root_metrics,
+
+            CAST([] AS STRUCT(
+                subtask_key VARCHAR, subtask_name VARCHAR, display_name VARCHAR,
+                canonical_display_name VARCHAR,
+                metrics STRUCT(
+                    metric_summary_id VARCHAR, metric_name VARCHAR,
+                    display_name VARCHAR, canonical_display_name VARCHAR,
+                    metric_key VARCHAR, lower_is_better BOOLEAN,
+                    models_count INTEGER, top_score DOUBLE, unit VARCHAR
+                )[]
+            )[])                                         AS subtasks,
+            CAST(0 AS INTEGER)                           AS subtasks_count
+        FROM benchmarks b
+        LEFT JOIN primary_metric pm     ON pm.benchmark_id = b.benchmark_id
+        LEFT JOIN canonical_metrics cmet ON cmet.id = pm.metric_id
+        LEFT JOIN primary_facts pf      ON pf.benchmark_id = b.benchmark_id
+        LEFT JOIN evaluator_names_agg ena ON ena.benchmark_id = b.benchmark_id
+        LEFT JOIN source_types_agg    sta ON sta.benchmark_id = b.benchmark_id
+        LEFT JOIN models top_m          ON top_m.model_id = pf.top_model_id
+        LEFT JOIN models bot_m          ON bot_m.model_id = pf.bottom_model_id
+        LEFT JOIN leaderboard_metrics_agg lma ON lma.benchmark_id = b.benchmark_id
+        LEFT JOIN leaderboard_rows_agg    lra ON lra.benchmark_id = b.benchmark_id
+        LEFT JOIN instance_summary        ins ON ins.benchmark_id = b.benchmark_id
+        ORDER BY b.benchmark_id
+        """
+    )
+
+
+def stage_j_emit_view_parquets(con, out_dir: Path, snapshot_id: str) -> None:
+    """Emit the three view-layer parquets to the warehouse snapshot dir.
+
+    Companion to `stage_i_emit_warehouse_parquets`. Stage J creates the
+    view tables on the connection (via the per-view materialiser
+    functions); this function writes them to disk.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for table, sort_key in [
+        ("eval_results_view", "(metric_summary_id, model_id)"),
+        ("models_view",       "(model_id)"),
+        ("evals_view",        "(evaluation_id)"),
     ]:
         path = out_dir / f"{table}.parquet"
         con.execute(
