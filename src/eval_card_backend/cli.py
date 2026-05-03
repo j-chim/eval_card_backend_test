@@ -62,8 +62,16 @@ def _cmd_canonicalise(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Quiet down some noisy loggers from upstream deps unless caller asks otherwise
+    # Quiet down some noisy loggers from upstream deps unless caller asks otherwise.
+    # httpx emits one INFO line per HTTP request; with ~18k record-file fetches
+    # that buries the actual pipeline log under per-file noise. The HF tqdm
+    # bar is similarly per-file in non-TTY (CI) sinks — disable it too.
     logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    from huggingface_hub.utils import disable_progress_bars
+    disable_progress_bars()
 
     from eval_card_backend.canonicalise import pipeline
 

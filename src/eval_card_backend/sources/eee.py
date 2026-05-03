@@ -24,7 +24,7 @@ from typing import Any, Iterable, Iterator
 import pyarrow as pa
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 
-from eval_card_backend.config import EEE_DATASET_REPO
+from eval_card_backend.config import EEE_DATASET_REPO, IGNORED_CONFIGS
 
 log = logging.getLogger(__name__)
 
@@ -78,15 +78,20 @@ def ensure_snapshot(local_dir: str, hf_token: str | None, force_refresh: bool) -
 
     data_dir = target / "data"
     if data_dir.exists() and any(data_dir.iterdir()):
+        log.info("EEE snapshot already present at %s — skipping download", target)
         return target
 
+    log.info("downloading EEE snapshot to %s …", target)
     snapshot_download(
         repo_id=EEE_DATASET_REPO,
         repo_type="dataset",
         local_dir=str(target),
         allow_patterns=["data/**"],
+        ignore_patterns=[f"data/{cfg}/**" for cfg in IGNORED_CONFIGS],
+        max_workers=32,
         token=hf_token,
     )
+    log.info("EEE snapshot ready at %s", target)
     return target
 
 
@@ -191,7 +196,10 @@ def load_arrow_table(
 
     rows: list[dict[str, Any]] = []
     for cfg in configs:
-        for path in list_json_files(cfg, eee_root, hf_token):
+        cfg_paths = list_json_files(cfg, eee_root, hf_token)
+        log.info("Stage A: loading config %s (%d records) …", cfg, len(cfg_paths))
+        cfg_kept_before = len(rows)
+        for path in cfg_paths:
             try:
                 rec = read_record(path, eee_root, hf_token)
             except Exception as exc:
@@ -220,6 +228,10 @@ def load_arrow_table(
             padded["source_config"] = cfg
             padded["_record_path"] = path
             rows.append(padded)
+        log.info(
+            "Stage A: %s done — kept %d / %d",
+            cfg, len(rows) - cfg_kept_before, len(cfg_paths),
+        )
 
     if not rows:
         # Empty table with the right schema so downstream con.register +
