@@ -2375,22 +2375,27 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             pm.top_score                                 AS top_score,
 
             COALESCE(b.card_present, FALSE)              AS has_card,
+            -- All VARCHAR[] fields normalise NULL → [] at the boundary so the
+            -- consumer-facing TS contract (`string[]`, non-nullable) holds.
+            -- Upstream JSON extraction returns NULL when the source omits a
+            -- field; without these COALESCE shims a missing `methodology.metrics`
+            -- crashes `methodology.metrics.length` in the frontend.
             CAST(struct_pack(
                 benchmark_details := struct_pack(
                     "name"    := b.card_name,
                     overview  := b.overview,
                     data_type := b.data_type,
-                    domains   := b.domains,
-                    languages := b.languages,
-                    similar_benchmarks := b.similar_benchmarks,
-                    resources := b.resources
+                    domains            := COALESCE(b.domains,            CAST([] AS VARCHAR[])),
+                    languages          := COALESCE(b.languages,          CAST([] AS VARCHAR[])),
+                    similar_benchmarks := COALESCE(b.similar_benchmarks, CAST([] AS VARCHAR[])),
+                    resources          := COALESCE(b.resources,          CAST([] AS VARCHAR[]))
                 ),
                 purpose_and_intended_users := struct_pack(
                     goal              := b.goal,
-                    audience          := b.audience,
-                    tasks             := b.tasks,
+                    audience          := COALESCE(b.audience,          CAST([] AS VARCHAR[])),
+                    tasks             := COALESCE(b.tasks,             CAST([] AS VARCHAR[])),
                     limitations       := b.limitations,
-                    out_of_scope_uses := b.out_of_scope_uses
+                    out_of_scope_uses := COALESCE(b.out_of_scope_uses, CAST([] AS VARCHAR[]))
                 ),
                 data := struct_pack(
                     source     := b.data_source,
@@ -2399,8 +2404,8 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     annotation := b.data_annotation
                 ),
                 methodology := struct_pack(
-                    methods          := b.methods,
-                    metrics          := b.card_metrics,
+                    methods          := COALESCE(b.methods,      CAST([] AS VARCHAR[])),
+                    metrics          := COALESCE(b.card_metrics, CAST([] AS VARCHAR[])),
                     calculation      := b.calculation,
                     interpretation   := b.interpretation,
                     baseline_results := b.baseline_results,
@@ -2412,7 +2417,10 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     consent_procedures           := b.consent_procedures,
                     compliance_with_regulations  := b.compliance_with_regulations
                 ),
-                possible_risks := b.possible_risks,
+                possible_risks := COALESCE(
+                    b.possible_risks,
+                    CAST([] AS STRUCT(category VARCHAR, description VARCHAR[], url VARCHAR)[])
+                ),
                 flagged_fields := b.flagged_fields,
                 missing_fields := CAST([] AS VARCHAR[]),
                 card_info := struct_pack(

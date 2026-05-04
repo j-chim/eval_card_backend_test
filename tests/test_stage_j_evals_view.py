@@ -190,6 +190,44 @@ def test_has_card_and_card_struct_populated(tmp_path, monkeypatch):
     assert name is not None
 
 
+def test_benchmark_card_array_fields_never_null(tmp_path, monkeypatch):
+    """Frontend reads `benchmark_card.methodology.metrics.length` etc. without
+    null guards because the TS contract says these are `string[]`. Source JSON
+    can omit any field, in which case the JSON extract returns NULL — the view
+    layer must COALESCE to [] so the contract holds. A regression here crashes
+    the eval detail page (see `BenchmarkCardPanel`).
+    """
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    con = _materialise_views(out)
+    rows = con.execute(
+        """
+        SELECT
+            benchmark_card.benchmark_details.domains            AS bd_domains,
+            benchmark_card.benchmark_details.languages          AS bd_languages,
+            benchmark_card.benchmark_details.similar_benchmarks AS bd_similar,
+            benchmark_card.benchmark_details.resources          AS bd_resources,
+            benchmark_card.purpose_and_intended_users.audience          AS pu_audience,
+            benchmark_card.purpose_and_intended_users.tasks             AS pu_tasks,
+            benchmark_card.purpose_and_intended_users.out_of_scope_uses AS pu_oos,
+            benchmark_card.methodology.methods AS m_methods,
+            benchmark_card.methodology.metrics AS m_metrics,
+            benchmark_card.possible_risks      AS risks,
+            benchmark_card.missing_fields      AS missing_fields
+        FROM evals_view
+        WHERE has_card
+        """
+    ).fetchall()
+    assert rows, "fixture has no carded evals; cannot exercise array contract"
+    for row in rows:
+        for field_value in row:
+            assert field_value is not None, (
+                "benchmark_card array field is NULL — frontend will crash on "
+                ".length / .map / .join (see BenchmarkCardPanel). Add a "
+                "COALESCE shim in stages.py at the struct_pack site."
+            )
+
+
 def test_tags_struct_shape(tmp_path, monkeypatch):
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")

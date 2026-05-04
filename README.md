@@ -86,11 +86,12 @@ warehouse/<snapshot_id>/
 ├── manifest.json                  # corpus scalars (model_count, eval_count, …)
 ├── headline.json                  # corpus signal aggregates (overall + by_category)
 ├── hierarchy.json                 # six-level family/composite/benchmark/metric tree
+├── comparison-index.json          # per-(eval, metric) leaderboards + inverse model→peer index
 └── snapshot_meta.json             # pipeline run metadata (tables, sidecars, row counts)
 ```
 
 The four canonical parquets are the source of truth (audit/debug);
-`*_view.parquet` + the three JSON sidecars are pre-baked for the
+`*_view.parquet` + the four JSON sidecars are pre-baked for the
 frontend to read without GROUP BYs.
 
 ## Environment variables
