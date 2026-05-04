@@ -59,6 +59,7 @@ def _materialise_views_and_sidecars(out_dir: Path):
     sidecars.write_manifest(con, out_dir, snap)
     sidecars.write_headline(con, out_dir, snap)
     sidecars.write_hierarchy(con, out_dir, snap)
+    sidecars.write_comparison_index(con, out_dir, snap)
     return con
 
 
@@ -97,6 +98,7 @@ def test_manifest_summary_artifact_pointers(tmp_path, monkeypatch):
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["summary_artifacts"]["corpus_aggregates"] == "headline.json"
     assert manifest["summary_artifacts"]["eval_hierarchy"] == "hierarchy.json"
+    assert manifest["summary_artifacts"]["comparison_index"] == "comparison-index.json"
 
 
 # ---------------------------------------------------------------------------
@@ -228,3 +230,147 @@ def test_metric_count_matches_distinct_benchmark_metric_pairs(tmp_path, monkeypa
         "WHERE benchmark_id IS NOT NULL AND metric_id IS NOT NULL"
     ).fetchone()[0]
     assert hi["stats"]["metric_count"] == expected
+
+
+# ---------------------------------------------------------------------------
+# comparison-index.json
+# ---------------------------------------------------------------------------
+
+
+def test_comparison_index_top_level_shape(tmp_path, monkeypatch):
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    assert {
+        "generated_at", "config_version", "metric_group_order",
+        "evals", "by_model",
+    } <= set(ci.keys())
+    assert ci["metric_group_order"][0] == "capability"
+
+
+def test_comparison_index_eval_keyset_covers_eval_results_view(tmp_path, monkeypatch):
+    """Every (evaluation_id, metric_summary_id) with a non-NULL score in
+    eval_results_view must be reachable in comparison-index. The frontend
+    skips evals not in this keyset, so any gap silently empties the grid.
+    """
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    con = _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    expected = {
+        (row[0], row[1])
+        for row in con.execute(
+            """
+            SELECT DISTINCT evaluation_id, metric_summary_id
+            FROM eval_results_view
+            WHERE score IS NOT NULL
+              AND evaluation_id IS NOT NULL
+              AND metric_summary_id IS NOT NULL
+              AND model_route_id IS NOT NULL
+            """
+        ).fetchall()
+    }
+    actual = {
+        (eval_id, metric["metric_summary_id"])
+        for eval_id, eval_entry in ci["evals"].items()
+        for metric in eval_entry["metrics"]
+    }
+    assert expected == actual
+
+
+def test_comparison_index_eval_entry_required_fields(tmp_path, monkeypatch):
+    """ComparisonEvalEntry contract — fields the frontend reads for
+    benchmark_family_key, display_name, category, etc."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    assert ci["evals"], "comparison-index has no evals; nothing to validate"
+    sample = next(iter(ci["evals"].values()))
+    assert {
+        "eval_summary_id", "benchmark_family_key", "benchmark_family_name",
+        "benchmark_parent_key", "benchmark_parent_name",
+        "benchmark_leaf_key", "benchmark_leaf_name",
+        "display_name", "category", "is_summary_score",
+        "summary_score_for", "summary_eval_ids", "metrics",
+    } <= set(sample.keys())
+
+
+def test_comparison_index_scores_ranked_best_first(tmp_path, monkeypatch):
+    """Within a metric, scores[] is ranked best-first respecting
+    lower_is_better; ties share a rank (dense-tie ranking)."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    for eval_entry in ci["evals"].values():
+        for metric in eval_entry["metrics"]:
+            scores = metric["scores"]
+            if len(scores) < 2:
+                continue
+            lib = metric["lower_is_better"]
+            for prev, curr in zip(scores, scores[1:]):
+                if lib:
+                    assert prev["score"] <= curr["score"]
+                else:
+                    assert prev["score"] >= curr["score"]
+                # Rank monotonic; equal-score peers may share a rank.
+                if prev["score"] == curr["score"]:
+                    assert prev["rank"] == curr["rank"]
+                else:
+                    assert prev["rank"] < curr["rank"]
+
+
+def test_comparison_index_metric_group_classified(tmp_path, monkeypatch):
+    """Every metric carries a group from the legacy taxonomy (not just a
+    flat default). Verifies the kind→group classifier and the regex
+    fallback both flow through to the emitted artifact."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    valid = set(ci["metric_group_order"])
+    seen_groups = set()
+    for eval_entry in ci["evals"].values():
+        for metric in eval_entry["metrics"]:
+            assert metric["group"] in valid
+            assert isinstance(metric["group_order"], int)
+            seen_groups.add(metric["group"])
+    # Fixtures_clean covers at least one capability metric (accuracy).
+    assert "capability" in seen_groups
+
+
+def test_comparison_index_metrics_ordered_by_group(tmp_path, monkeypatch):
+    """Within an eval, metrics sort by (group_order, metric_name) so
+    capability tabs surface first across every benchmark."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    for eval_entry in ci["evals"].values():
+        metrics = eval_entry["metrics"]
+        keys = [(m["group_order"], m["metric_name"] or "") for m in metrics]
+        assert keys == sorted(keys)
+
+
+def test_comparison_index_by_model_inverse_consistent(tmp_path, monkeypatch):
+    """For every (route, eval, metric) entry in by_model, the corresponding
+    score in evals[eval].metrics[metric].scores must agree on score/rank/total."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    for route, eval_map in ci["by_model"].items():
+        for eval_id, metric_map in eval_map.items():
+            for metric_summary_id, by_model_entry in metric_map.items():
+                metric = next(
+                    m for m in ci["evals"][eval_id]["metrics"]
+                    if m["metric_summary_id"] == metric_summary_id
+                )
+                forward = next(
+                    s for s in metric["scores"] if s["model_route_id"] == route
+                )
+                assert forward["score"] == by_model_entry["score"]
+                assert forward["rank"]  == by_model_entry["rank"]
+                assert forward["total"] == by_model_entry["total"]

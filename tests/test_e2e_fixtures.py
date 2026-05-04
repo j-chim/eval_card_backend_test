@@ -308,8 +308,9 @@ def test_all_configs_run_without_error(tmp_path, monkeypatch):
     )
 
     df = _facts(out)
-    # 10 EEE records total; 1 has no score → 9 fact rows.
-    assert len(df) == 9
+    # 13 EEE records total (10 + 3 from fixtures_slices); 1 has no score
+    # → 12 fact rows.
+    assert len(df) == 12
 
     # Resolved-keys counts
     assert df["benchmark_id"].notna().all()    # all benchmarks resolve
@@ -318,11 +319,16 @@ def test_all_configs_run_without_error(tmp_path, monkeypatch):
     assert df["model_id"].isna().sum() == 1
 
     # slice_key / slice_name columns are plumbed through Stages C→D→E→F→I.
-    # Every fixture uses a single benchmark_raw per canonical (e.g. all
-    # mmlu rows write evaluation_name="mmlu"), so the multi-raw heuristic
-    # never fires and both columns are NULL across the corpus. The
-    # multi-raw populated path is covered by tests/test_stage_c_slice.py.
+    # The cross-config snapshot has 3 distinct raws resolving to mmlu —
+    # "mmlu", "Anatomy", "Astronomy" — so EVERY row with benchmark_id=mmlu
+    # gets a slice_key (including the literal-"mmlu" rows from older
+    # fixtures, which represent the overall MMLU rollup as its own
+    # slice). Only the swebench-verified + appworld rows stay NULL since
+    # those benchmarks have one raw each in the snapshot.
     assert "slice_key" in df.columns
     assert "slice_name" in df.columns
-    assert df["slice_key"].isna().all()
-    assert df["slice_name"].isna().all()
+    mmlu_rows = df[df["benchmark_id"] == "mmlu"]
+    assert mmlu_rows["slice_key"].notna().all()
+    assert set(mmlu_rows["slice_key"]) == {"mmlu", "anatomy", "astronomy"}
+    non_mmlu = df[df["benchmark_id"] != "mmlu"]
+    assert non_mmlu["slice_key"].isna().all()

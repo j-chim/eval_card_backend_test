@@ -896,13 +896,27 @@ def stage_e_per_row_signals(con) -> StageEStats:
 
 
 def stage_f_group_signals(con, snapshot_id: str) -> int:
-    """Returns the count of comparability groups whose rows reported >1
+    """Group-level signal pass. Two distinct groupings:
+
+      - **Provenance** (F.1) — `(model_id, benchmark_id)`. Multi-source /
+        first-party-only is a property of the model's reporting coverage
+        on a benchmark; orthogonal to which metric or which slice. A
+        third-party that reports any metric or slice on the pair counts
+        as cross-party verification.
+      - **Comparability** (F.2) — `(model_id, benchmark_id, slice_key,
+        metric_id)`. Divergence asks whether parties / setups disagree on
+        the same measurement, so the group key is the actual measurement.
+        Slices (e.g. MMLU subjects) are different measurements; folding
+        them into one divergence calculation conflates natural cross-
+        subject score spread with methodological disagreement.
+
+    Returns the count of comparability groups whose rows reported >1
     distinct `metric_unit`. A non-zero count means the per-group divergence
     threshold was computed against a deterministic-but-not-row-matching
     unit, and the operator should backfill the registry's metric_unit
     column for the offending canonical metric.
     """
-    # F.1 — group-derived provenance
+    # F.1 — provenance, per (model, benchmark)
     con.execute(
         f"""
         CREATE TABLE fact_results_grouped AS
@@ -911,33 +925,31 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
                 {org_normalize_sql('org_raw')}
                   AS org_normalized_key
             FROM fact_results_signaled
-            WHERE model_id IS NOT NULL
+            WHERE model_id     IS NOT NULL
               AND benchmark_id IS NOT NULL
-              AND metric_id IS NOT NULL
+              AND metric_id    IS NOT NULL
         ),
         group_orgs AS (
             SELECT
-                model_id, benchmark_id, metric_id,
+                model_id, benchmark_id,
                 COUNT(DISTINCT org_normalized_key)
                   FILTER (WHERE org_normalized_key IS NOT NULL)
                   AS distinct_reporting_orgs
             FROM org_normalized
-            GROUP BY 1, 2, 3
+            GROUP BY 1, 2
         )
         SELECT
             o.*,
             go.distinct_reporting_orgs,
-            md5(o.model_id || '|' || o.benchmark_id || '|' || o.metric_id)
-              AS comparability_group_id,
             go.distinct_reporting_orgs > 1 AS is_multi_source,
             (o.provenance_source_type = 'first_party' AND go.distinct_reporting_orgs = 1)
               AS first_party_only
         FROM org_normalized o
-        JOIN group_orgs go USING (model_id, benchmark_id, metric_id)
+        JOIN group_orgs go USING (model_id, benchmark_id)
         """
     )
 
-    # F.2 — variant + cross-party divergence.
+    # F.2 — comparability, per (model, benchmark, slice, metric).
     #
     # Per-group metric_config used by the divergence threshold MUST be
     # deterministic across re-runs and consistent across all rows in the
@@ -947,12 +959,17 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
     # canonical metric — `n_metric_unit_distinct` surfaces those groups
     # so the operator can target a registry-alias backfill at the right
     # canonical metric.
+    #
+    # `slice_key` IS NOT DISTINCT FROM in the JOIN treats NULL slice_key
+    # (single-raw benchmarks) as equal — a plain `=` would drop those
+    # rows since SQL NULL = NULL is unknown. GROUP BY collapses NULL
+    # slice_keys to one group automatically, so the JOIN must mirror that.
     con.execute(
         """
         CREATE TABLE fact_results_grouped_annotated AS
         WITH group_payloads AS (
             SELECT
-                model_id, benchmark_id, metric_id,
+                model_id, benchmark_id, slice_key, metric_id,
                 array_agg(struct_pack(
                     fact_id                  := fact_id,
                     evaluation_id            := evaluation_id,
@@ -968,17 +985,20 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
                     max_score   := MAX(max_score)   FILTER (WHERE max_score   IS NOT NULL)
                 ) AS metric_config
             FROM fact_results_grouped
-            GROUP BY 1, 2, 3
+            GROUP BY 1, 2, 3, 4
         ),
         group_annotations AS (
             SELECT
-                model_id, benchmark_id, metric_id,
+                model_id, benchmark_id, slice_key, metric_id,
                 compute_variant_divergence_udf(group_rows, metric_config)      AS variant,
                 compute_cross_party_divergence_udf(group_rows, metric_config)  AS cross_party
             FROM group_payloads
         )
         SELECT
             fr.*,
+            md5(fr.model_id || '|' || fr.benchmark_id || '|'
+                || COALESCE(fr.slice_key, '') || '|' || fr.metric_id)
+              AS comparability_group_id,
             ga.variant.has_variant_divergence       AS has_variant_divergence,
             ga.variant.divergence_magnitude         AS variant_divergence_magnitude,
             ga.variant.threshold_used               AS variant_divergence_threshold,
@@ -993,7 +1013,11 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
             ga.cross_party.organization_count          AS cross_party_org_count,
             ga.cross_party.scores_by_organization      AS scores_by_organization
         FROM fact_results_grouped fr
-        LEFT JOIN group_annotations ga USING (model_id, benchmark_id, metric_id)
+        LEFT JOIN group_annotations ga
+          ON ga.model_id     = fr.model_id
+         AND ga.benchmark_id = fr.benchmark_id
+         AND ga.slice_key IS NOT DISTINCT FROM fr.slice_key
+         AND ga.metric_id    = fr.metric_id
         """
     )
 
@@ -1384,22 +1408,35 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 ARRAY_AGG(DISTINCT org_raw)
                     FILTER (WHERE org_raw IS NOT NULL)
                     AS reporting_orgs,
-                -- Group-derived columns are constant within a triple by Stage F's
-                -- construction; ANY_VALUE is exact.
+                -- Provenance signals (`is_multi_source`, `first_party_only`)
+                -- are computed at the (model, benchmark) level in Stage F.1
+                -- and so are constant across all (slice, metric) rows in this
+                -- triple — ANY_VALUE is exact.
+                --
+                -- Comparability signals (variant + cross-party divergence)
+                -- are computed at (model, benchmark, slice, metric) in
+                -- Stage F.2, so different slices on the same metric carry
+                -- different values. The triple-level rollup uses BOOL_OR
+                -- for booleans ("does any slice diverge?") and MAX for
+                -- magnitudes / org counts ("worst slice"). Threshold + basis
+                -- are derived from per-metric metric_config and stay
+                -- constant; differing_fields and scores_by_organization
+                -- vary per-slice and we surface an arbitrary representative
+                -- via ANY_VALUE.
                 ANY_VALUE(scores_by_organization)        AS scores_by_organization,
                 ANY_VALUE(is_multi_source)               AS is_multi_source,
                 ANY_VALUE(first_party_only)              AS first_party_only,
-                ANY_VALUE(has_variant_divergence)        AS has_variant_divergence,
-                ANY_VALUE(has_cross_party_divergence)    AS has_cross_party_divergence,
-                ANY_VALUE(variant_divergence_magnitude)  AS variant_divergence_magnitude,
+                BOOL_OR(has_variant_divergence)          AS has_variant_divergence,
+                BOOL_OR(has_cross_party_divergence)      AS has_cross_party_divergence,
+                MAX(variant_divergence_magnitude)        AS variant_divergence_magnitude,
                 ANY_VALUE(variant_divergence_threshold)  AS variant_divergence_threshold,
                 ANY_VALUE(variant_threshold_basis)       AS variant_threshold_basis,
                 ANY_VALUE(variant_differing_fields)      AS variant_differing_fields,
-                ANY_VALUE(cross_party_divergence_magnitude) AS cross_party_divergence_magnitude,
+                MAX(cross_party_divergence_magnitude)    AS cross_party_divergence_magnitude,
                 ANY_VALUE(cross_party_divergence_threshold) AS cross_party_divergence_threshold,
                 ANY_VALUE(cross_party_threshold_basis)      AS cross_party_threshold_basis,
                 ANY_VALUE(cross_party_differing_fields)     AS cross_party_differing_fields,
-                ANY_VALUE(cross_party_org_count)            AS cross_party_org_count,
+                MAX(cross_party_org_count)                  AS cross_party_org_count,
                 BOOL_OR(has_reproducibility_gap)         AS triple_has_repro_gap,
                 AVG(completeness_score)                  AS triple_avg_completeness
             FROM tris

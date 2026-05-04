@@ -419,7 +419,11 @@ def run(
         sidecars.write_manifest(con, out_dir, meta)
         sidecars.write_headline(con, out_dir, meta)
         sidecars.write_hierarchy(con, out_dir, meta)
-        log.info("Stage J: wrote sidecars (manifest, headline, hierarchy) to %s", out_dir)
+        sidecars.write_comparison_index(con, out_dir, meta)
+        log.info(
+            "Stage J: wrote sidecars (manifest, headline, hierarchy, comparison-index) to %s",
+            out_dir,
+        )
 
     # 13. Summaries
     udfs.log_resolver_summary()

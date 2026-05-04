@@ -223,6 +223,48 @@ def write_eee_fixtures():
                 generation_args={"temperature": 0.0, "max_tokens": 1024},
             ),
         ),
+        # 08a, 08b, 08c — slice fixture. Three eval_results all resolving
+        # to benchmark_id=mmlu via the registry: "Anatomy" + "Astronomy"
+        # (≥2 distinct cleaned raws → Stage C populates slice_key) plus a
+        # second org reporting on Anatomy (cross-party at the slice
+        # level). Exercises:
+        #  - Stage C: slice_key/slice_name populate; case-normalized.
+        #  - Stage F.1: is_multi_source=True on ALL rows because the
+        #    (gpt-4o, mmlu) pair has 2 distinct orgs total — even on the
+        #    Astronomy row where only OpenAI reported. Slice/metric-agnostic.
+        #  - Stage F.2: comparability_group_id differs between Anatomy
+        #    and Astronomy rows (slice in the md5 input).
+        (
+            "fixtures_slices", "openai", "gpt-4o", "08a-anatomy-openai",
+            _eee_record(
+                config="fixtures_slices", dev="openai", model="GPT-4o",
+                eval_id="ev_08a", model_id="openai/gpt-4o", org="OpenAI",
+                evaluation_name="Anatomy", metric_name="Accuracy",
+                metric_id="mmlu.acc", score=0.85,
+                generation_args={"temperature": 0.0, "max_tokens": 1024},
+            ),
+        ),
+        (
+            "fixtures_slices", "openai", "gpt-4o", "08b-anatomy-thirdparty",
+            _eee_record(
+                config="fixtures_slices", dev="openai", model="GPT-4o",
+                eval_id="ev_08b", model_id="openai/gpt-4o", org="Scale AI",
+                evaluation_name="Anatomy", metric_name="Accuracy",
+                metric_id="mmlu.acc", score=0.62,
+                evaluator_relationship="third_party",
+                generation_args={"temperature": 0.0, "max_tokens": 1024},
+            ),
+        ),
+        (
+            "fixtures_slices", "openai", "gpt-4o", "08c-astronomy-openai",
+            _eee_record(
+                config="fixtures_slices", dev="openai", model="GPT-4o",
+                eval_id="ev_08c", model_id="openai/gpt-4o", org="OpenAI",
+                evaluation_name="Astronomy", metric_name="Accuracy",
+                metric_id="mmlu.acc", score=0.78,
+                generation_args={"temperature": 0.0, "max_tokens": 1024},
+            ),
+        ),
     ]
 
     for cfg, dev, model, fname, record in fixtures:
@@ -340,6 +382,10 @@ def write_registry_fixtures():
          "canonical_id": "anthropic/claude-sonnet"},
         # Benchmarks
         {"raw_value": "mmlu", "entity_type": "benchmark", "canonical_id": "mmlu"},
+        # Slice-bearing aliases — multiple raws collapse to mmlu so the
+        # fixtures_slices config exercises Stage C's multi-raw heuristic.
+        {"raw_value": "Anatomy",   "entity_type": "benchmark", "canonical_id": "mmlu"},
+        {"raw_value": "Astronomy", "entity_type": "benchmark", "canonical_id": "mmlu"},
         {"raw_value": "swebench-verified", "entity_type": "benchmark",
          "canonical_id": "swebench-verified"},
         {"raw_value": "appworld", "entity_type": "benchmark",
