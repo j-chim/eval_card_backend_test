@@ -167,6 +167,7 @@ def run(
     no_cache: bool = False,
     from_stage: str | None = None,
     to_stage: str | None = None,
+    taxonomy_seed_dir: str | Path | None = None,
 ) -> Path | None:
     """Run the canonicalisation pipeline. Returns the snapshot output directory,
     or `None` when `to_stage` cuts the run off before Stage I (no warehouse
@@ -261,6 +262,26 @@ def run(
             from_stage, len(restored), cache.dir, restored,
         )
 
+        # The composite_config_map cache is one of stage A's outputs. A 0-row
+        # restoration means a prior run wrote an empty map (e.g. taxonomy
+        # seed dir was missing) — and silently restoring it now would
+        # propagate that corruption into every downstream stage's
+        # composite_slug / composite_display_name fallbacks. Fail fast and
+        # tell the operator to refresh stage A.
+        if "composite_config_map" in restored:
+            ccm_rows = con.execute(
+                "SELECT COUNT(*) FROM composite_config_map"
+            ).fetchone()[0]
+            if ccm_rows == 0:
+                raise RuntimeError(
+                    f"composite_config_map restored from cache at {cache.dir} "
+                    f"has 0 rows. A prior run wrote a corrupt cache (most likely "
+                    f"because the taxonomy seed dir was missing at that time). "
+                    f"Re-run with --from-stage A to rebuild the cache from "
+                    f"composites.yaml / families.yaml, or wipe the snapshot "
+                    f"directory under {cache.root}."
+                )
+
     # ---- Stage execution ----
     n_eee: int | None = None
     n_cards: int | None = None
@@ -289,6 +310,7 @@ def run(
             dim_paths = registry_src.open_dim_paths(registry_root)
             stages.stage_a_load_registry(
                 con, dim_paths, registry_root=registry_root,
+                taxonomy_seed_dir=Path(taxonomy_seed_dir) if taxonomy_seed_dir else None,
             )
             log.info("  registry dims loaded: %s", sorted(dim_paths))
         elif letter == "B":

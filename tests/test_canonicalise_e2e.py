@@ -130,6 +130,19 @@ def _write_registry_fixture(reg_root: Path) -> None:
     ).to_parquet(reg_root / "eval_harnesses" / "part-0.parquet")
 
 
+def _write_minimal_seed_fixture(seed_root: Path) -> None:
+    """Lay down a stub composites.yaml so taxonomy.load_and_materialise gets
+    a non-empty composite_config_map. Without this, stage A writes a 0-row
+    map to cache, which the pipeline's stale-cache check then refuses to
+    restore on --from-stage runs. The contents don't have to match the
+    fixture's source_configs — the cache check only requires >0 rows.
+    """
+    seed_root.mkdir(parents=True, exist_ok=True)
+    (seed_root / "composites.yaml").write_text(
+        "minibench:\n  display: MiniBench\n  configs:\n    - minibench\n"
+    )
+
+
 def _write_cards_fixture(cards_root: Path) -> None:
     (cards_root / "cards").mkdir(parents=True)
     card = {
@@ -171,6 +184,8 @@ def test_pipeline_end_to_end(tmp_path, monkeypatch):
     warehouse = tmp_path / "warehouse"
     _write_eee_fixture(eee_root)
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     # Force the source loaders into local-only mode by setting the env vars.
@@ -189,6 +204,7 @@ def test_pipeline_end_to_end(tmp_path, monkeypatch):
         snapshot_id="2026-04-30T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 
@@ -331,6 +347,8 @@ def test_pipeline_from_stage_j_rebakes_view_layer(tmp_path, monkeypatch):
     warehouse = tmp_path / "warehouse"
     _write_eee_fixture(eee_root)
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     monkeypatch.setenv("EEE_LOCAL_DATASET_DIR", str(eee_root))
@@ -351,6 +369,7 @@ def test_pipeline_from_stage_j_rebakes_view_layer(tmp_path, monkeypatch):
         snapshot_id=snapshot,
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(cache_root),
     )
     assert out_dir is not None
@@ -370,6 +389,7 @@ def test_pipeline_from_stage_j_rebakes_view_layer(tmp_path, monkeypatch):
         snapshot_id=snapshot,
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(cache_root),
         from_stage="J",
     )
@@ -404,6 +424,8 @@ def test_metric_unit_inconsistency_is_deterministic_and_counted(tmp_path, monkey
     cards_root = tmp_path / "cards"
     warehouse = tmp_path / "warehouse"
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     config_dir = eee_root / "data" / "minibench" / "openai" / "gpt-4o"
@@ -472,6 +494,7 @@ def test_metric_unit_inconsistency_is_deterministic_and_counted(tmp_path, monkey
         snapshot_id="2026-05-03T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 
@@ -499,6 +522,8 @@ def test_score_scale_anomaly_fires_on_declared_range_violations(tmp_path, monkey
     cards_root = tmp_path / "cards"
     warehouse = tmp_path / "warehouse"
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     config_dir = eee_root / "data" / "minibench" / "openai" / "gpt-4o"
@@ -570,6 +595,7 @@ def test_score_scale_anomaly_fires_on_declared_range_violations(tmp_path, monkey
         snapshot_id="2026-05-03T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 
@@ -597,6 +623,8 @@ def test_harness_raw_strips_unknown_version_sentinel(tmp_path, monkeypatch):
     cards_root = tmp_path / "cards"
     warehouse = tmp_path / "warehouse"
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     config_dir = eee_root / "data" / "minibench" / "openai" / "gpt-4o"
@@ -650,6 +678,7 @@ def test_harness_raw_strips_unknown_version_sentinel(tmp_path, monkeypatch):
         snapshot_id="2026-05-03T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 
@@ -680,6 +709,8 @@ def test_pipeline_drops_score_sentinel_when_scale_excludes_it(tmp_path, monkeypa
     cards_root = tmp_path / "cards"
     warehouse = tmp_path / "warehouse"
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     config_dir = eee_root / "data" / "minibench" / "openai" / "gpt-4o"
@@ -757,6 +788,7 @@ def test_pipeline_drops_score_sentinel_when_scale_excludes_it(tmp_path, monkeypa
         snapshot_id="2026-05-03T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 
@@ -790,6 +822,8 @@ def test_pipeline_dedupes_fact_id_collisions(tmp_path, monkeypatch):
     cards_root = tmp_path / "cards"
     warehouse = tmp_path / "warehouse"
     _write_registry_fixture(reg_root)
+    seed_root = tmp_path / "seed"
+    _write_minimal_seed_fixture(seed_root)
     _write_cards_fixture(cards_root)
 
     # Two records, same evaluation_id, same one-element evaluation_results[]
@@ -848,6 +882,7 @@ def test_pipeline_dedupes_fact_id_collisions(tmp_path, monkeypatch):
         snapshot_id="2026-05-03T00:00:00Z",
         warehouse_dir=str(warehouse),
         registry_local_dir=str(reg_root),
+        taxonomy_seed_dir=str(seed_root),
         cache_root=str(tmp_path / "cache"),
     )
 

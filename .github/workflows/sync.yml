@@ -39,20 +39,39 @@ jobs:
       - name: Sync dependencies
         run: uv sync --all-groups
 
-      - name: Cache HF dataset snapshots
+      # Stage cache (.cache/canonicalise/) is intentionally NOT cached:
+      # production runs always mint fresh snapshot IDs and never invoke
+      # --from-stage on prior runs. Caching it would just accumulate
+      # stale snapshot dirs.
+
+      - name: Cache EEE + benchmark-cards snapshots
         uses: actions/cache@v4
         with:
-          # Stage cache (.cache/canonicalise/) is intentionally NOT cached:
-          # production runs always mint fresh snapshot IDs and never invoke
-          # --from-stage on prior runs. Caching it would just accumulate
-          # stale snapshot dirs.
           path: |
             .cache/eee_datastore
             .cache/auto_benchmarkcards
-            .cache/entity_registry
-          key: hf-snapshots-${{ github.run_id }}
+          key: hf-bulk-${{ github.run_id }}
           restore-keys: |
-            hf-snapshots-
+            hf-bulk-
+
+      # Registry cache is keyed on the entity-registry-data dataset's HEAD
+      # revision so that newly-seeded aliases/canonicals are picked up on
+      # the next sync. No restore-keys: a SHA mismatch must force a fresh
+      # download (otherwise the producer's `ensure_snapshot` short-circuits
+      # on a stale cache and never sees the new entities).
+      - name: Resolve entity-registry-data revision
+        id: registry-rev
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          SHA=$(curl -fsSL -H "Authorization: Bearer $HF_TOKEN" "https://huggingface.co/api/datasets/evaleval/entity-registry-data" | jq -r .sha)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache entity-registry snapshot
+        uses: actions/cache@v4
+        with:
+          path: .cache/entity_registry
+          key: entity-registry-${{ steps.registry-rev.outputs.sha }}
 
       - name: Run tests
         env:

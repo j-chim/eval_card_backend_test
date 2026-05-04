@@ -279,23 +279,29 @@ def load_and_materialise(
     """
     seed_dir = resolve_seed_dir(registry_root, seed_dir_override)
     if seed_dir is None:
-        log.info(
-            "taxonomy: no seed dir found (override=%s, registry_root=%s); "
-            "all composites/families/slices use defaults.",
-            seed_dir_override, registry_root,
+        raise RuntimeError(
+            "taxonomy: no seed dir found "
+            f"(override={seed_dir_override!r}, registry_root={registry_root!r}). "
+            "The curated composite/family/slice YAMLs are required — without them, "
+            "composite_slug falls back to kebab-case(source_config) and "
+            "composite_display_name falls back to the per-record EEE "
+            "source_metadata.source_name. That is non-deterministic for any "
+            "leaderboard whose source_name varies per record (Vals.ai, reward-bench, "
+            "Wasp), and silently splits multi-config leaderboards into per-config "
+            "composites. Fix: set EVALCARD_REGISTRY_SEED_DIR, pass "
+            "--taxonomy-seed-dir, or check out eval-card-registry/ as a sibling of "
+            "this repo so resolve_seed_dir() can find the YAMLs. To intentionally "
+            "run without a curated taxonomy, pass an explicit empty-but-existing "
+            "directory as the override."
         )
-        composites: dict[str, dict] = {}
-        families: dict[str, dict] = {}
-        promotions: set[str] = set()
-    else:
-        log.info("taxonomy: loading seed YAMLs from %s", seed_dir)
-        composites = load_composites(seed_dir)
-        families = load_families(seed_dir)
-        promotions = load_slice_promotions(seed_dir)
-        log.info(
-            "taxonomy: %d composite(s), %d curated family(ies), "
-            "%d slice promotion(s)",
-            len(composites), len(families), len(promotions),
-        )
+    log.info("taxonomy: loading seed YAMLs from %s", seed_dir)
+    composites = load_composites(seed_dir)
+    families = load_families(seed_dir)
+    promotions = load_slice_promotions(seed_dir)
+    log.info(
+        "taxonomy: %d composite(s), %d curated family(ies), "
+        "%d slice promotion(s)",
+        len(composites), len(families), len(promotions),
+    )
     materialise_taxonomy_tables(con, composites, families, promotions)
     return composites, families, promotions
