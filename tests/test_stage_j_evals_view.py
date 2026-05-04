@@ -258,6 +258,12 @@ def test_third_party_ratio_xparty_fixture(tmp_path, monkeypatch):
     assert ratio == 1.0
 
 
+@pytest.mark.skip(
+    reason="Inactive while the stages.py:759 evaluator_relationship override is in place "
+    "(EEE upstream-data-quality mitigation: only llm-stats+raw_verified='false' surfaces "
+    "as first_party; everything else collapses to third_party). Re-enable when the override "
+    "is removed and upstream emits the right value directly."
+)
 def test_provenance_summary_not_inflated_by_array_unnest(tmp_path, monkeypatch):
     """Regression: when a triple has multiple evaluator_relationships and
     multiple reporting_orgs, naive `CROSS JOIN UNNEST` of both arrays

@@ -77,6 +77,11 @@ def write_manifest(con, out_dir: Path, snapshot_meta: dict) -> Path:
         "composite_count":       int(composite_count or 0),
         "source_config_count":   len(snapshot_meta.get("configs") or []),
         "skipped_config_count":  len(skipped),
+        # Upstream-input pins — answer "is this snapshot reading stale
+        # registry/EEE data?" without a follow-up HF query. Each entry
+        # is `{repo_id, sha, last_modified}`; values are None on lookup
+        # failure (best-effort, never fatal — see _hf_dataset_snapshot).
+        "upstream_pins":         snapshot_meta.get("upstream_pins") or {},
         "summary_artifacts": {
             "corpus_aggregates": "headline.json",
             "eval_hierarchy":    "hierarchy.json",

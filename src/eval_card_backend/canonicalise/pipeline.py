@@ -62,21 +62,41 @@ from eval_card_backend.sources import benchmark_cards, eee, registry as registry
 log = logging.getLogger(__name__)
 
 
-def _hf_revision(repo_id: str, hf_token: str | None) -> str | None:
+def _hf_dataset_snapshot(repo_id: str, hf_token: str | None) -> dict | None:
+    """Return ``{sha, last_modified}`` for an HF dataset repo, or None on
+    failure. Used to stamp every snapshot with the upstream revision pins
+    so consumers can answer "is this run consuming stale registry data?"
+    without re-querying HF after the fact.
+
+    `last_modified` is ISO-8601 (HF's API serialises ``datetime`` → str
+    when it goes through the JSON path; we canonicalise here).
+    """
     try:
         from huggingface_hub import HfApi
 
         api = HfApi(token=hf_token)
         info = api.dataset_info(repo_id, token=hf_token)
-        return info.sha
+        last_modified = getattr(info, "last_modified", None)
+        if last_modified is not None and not isinstance(last_modified, str):
+            # `huggingface_hub` returns a tz-aware datetime; ISO-8601 it
+            # so manifest.json round-trips cleanly through any consumer.
+            last_modified = last_modified.isoformat()
+        return {"sha": info.sha, "last_modified": last_modified}
     except Exception as exc:
         # Don't fail the whole snapshot for a missing revision sidecar entry,
         # but DO surface the failure — bad repo id, auth issue, and network
         # blip all surface as `null` in snapshot_meta.json otherwise. Type +
         # message is enough; the full traceback is noisy on benign 503s.
-        log.warning("hf_revision lookup failed for %s: %s: %s",
+        log.warning("hf_dataset_snapshot lookup failed for %s: %s: %s",
                     repo_id, type(exc).__name__, exc)
         return None
+
+
+def _hf_revision(repo_id: str, hf_token: str | None) -> str | None:
+    """Backward-compatible scalar-SHA helper. Prefer `_hf_dataset_snapshot`
+    for new call sites that also want `last_modified`."""
+    info = _hf_dataset_snapshot(repo_id, hf_token)
+    return info["sha"] if info else None
 
 
 def preflight(
@@ -506,15 +526,33 @@ def _build_snapshot_meta(
         ]
         sidecars = ["manifest.json", "headline.json", "hierarchy.json"]
 
+    # Single HTTP call per upstream — captures both sha and last_modified
+    # so manifest.json can surface "registry parquet was last refreshed
+    # at <ts>; this snapshot's run consumed it" without a follow-up query.
+    eee_info = _hf_dataset_snapshot(EEE_DATASET_REPO, settings.hf_token)
+    registry_info = _hf_dataset_snapshot(
+        ENTITY_REGISTRY_DATASET_REPO, settings.hf_token
+    )
+    cards_info = _hf_dataset_snapshot(
+        BENCHMARK_METADATA_DATASET_REPO, settings.hf_token
+    )
+
     return {
         "snapshot_id": snapshot_id,
         "generated_at": _make_snapshot_id(),
         "configs": chosen,
-        "eee_revision": _hf_revision(EEE_DATASET_REPO, settings.hf_token),
-        "registry_revision": _hf_revision(ENTITY_REGISTRY_DATASET_REPO, settings.hf_token),
-        "cards_revision": _hf_revision(
-            BENCHMARK_METADATA_DATASET_REPO, settings.hf_token
-        ),
+        "eee_revision": eee_info["sha"] if eee_info else None,
+        "registry_revision": registry_info["sha"] if registry_info else None,
+        "cards_revision": cards_info["sha"] if cards_info else None,
+        # Structured upstream-pin records — same data as the *_revision
+        # scalars plus last_modified. Consumed by `write_manifest` so the
+        # warehouse manifest carries enough info to diagnose stale-input
+        # runs without re-querying HF.
+        "upstream_pins": {
+            "eee_datastore": {"repo_id": EEE_DATASET_REPO, **(eee_info or {"sha": None, "last_modified": None})},
+            "entity_registry": {"repo_id": ENTITY_REGISTRY_DATASET_REPO, **(registry_info or {"sha": None, "last_modified": None})},
+            "benchmark_metadata": {"repo_id": BENCHMARK_METADATA_DATASET_REPO, **(cards_info or {"sha": None, "last_modified": None})},
+        },
         "tables": tables,
         "sidecars": sidecars,
         "row_counts": {

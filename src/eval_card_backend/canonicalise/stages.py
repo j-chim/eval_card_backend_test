@@ -756,7 +756,20 @@ def stage_d_join_dims_and_flatten(con) -> None:
             CAST(j.score_details.uncertainty.num_samples AS INTEGER)                    AS n_samples,
 
             -- source / provenance
-            j.source_metadata.evaluator_relationship                                    AS evaluator_relationship,
+            -- TEMPORARY upstream-data-quality fix (ported from the legacy
+            -- pipeline's PARTY_OVERRIDE_LLM_STATS_FIX): EEE's llm-stats config
+            -- carries `evaluator_relationship` from the aggregator's
+            -- perspective, but the underlying rows are model-maker self-reports
+            -- (raw_verified='false') vs aggregator-verified rescores
+            -- (raw_verified='true'). Reclassify on the row, not in the
+            -- frontend, so every consumer agrees. Remove once upstream EEE
+            -- emits the right value directly.
+            CASE
+                WHEN j.source_config = 'llm-stats'
+                     AND j.metric_config.additional_details['raw_verified'] = 'false'
+                THEN 'first_party'
+                ELSE 'third_party'
+            END                                                                          AS evaluator_relationship,
             j.source_metadata.source_type                                               AS source_type,
             j.source_metadata.source_organization_url                                   AS source_organization_url,
             j.eval_library.name                                                         AS eval_library_name,
