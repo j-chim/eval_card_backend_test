@@ -85,7 +85,7 @@ warehouse/<snapshot_id>/
 ├── evals_view.parquet             # one row per benchmark, multi-metric pre-pivoted
 ├── manifest.json                  # corpus scalars (model_count, eval_count, …)
 ├── headline.json                  # corpus signal aggregates (overall + by_category)
-├── hierarchy.json                 # six-level family/composite/benchmark/metric tree
+├── hierarchy.json                 # top-level composites[] tree + flat families[] lookup
 ├── comparison-index.json          # per-(eval, metric) leaderboards + inverse model→peer index
 └── snapshot_meta.json             # pipeline run metadata (tables, sidecars, row counts)
 ```

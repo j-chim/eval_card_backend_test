@@ -367,7 +367,13 @@ def _load_dim(con, name: str, dim_paths: dict) -> None:
     )
 
 
-def stage_a_load_registry(con, dim_paths: dict) -> None:
+def stage_a_load_registry(
+    con,
+    dim_paths: dict,
+    *,
+    registry_root: Path | None = None,
+    taxonomy_seed_dir: Path | None = None,
+) -> None:
     """Load registry dim tables. Aliases each dim's columns to the spec shape;
     where the registry doesn't carry a column yet, project NULL.
 
@@ -375,7 +381,21 @@ def stage_a_load_registry(con, dim_paths: dict) -> None:
     `parents` JSON list — the registry switched from a scalar
     `parent_model_id` column to a list of typed edges, and downstream
     SQL still wants the flat scalar.
+
+    Loads the composite/family/slice taxonomy seed (`composites.yaml`,
+    `families.yaml`, `slice_overrides.yaml`) into three small tables on
+    the connection (`composite_config_map`, `family_membership`,
+    `slice_promotions`). Applies slice grouping to
+    `canonical_benchmarks.parent_benchmark_id` so sibling benchmarks
+    (e.g., `gaia` + `gaia-level-1/2/3`) share a slice parent, with the
+    promotion set respected so e.g. `bfcl-live` stays a top-level
+    benchmark rather than collapsing to a phantom `bfcl` stem.
     """
+    from eval_card_backend.canonicalise import taxonomy
+    from eval_card_backend.canonicalise.slice_grouping import (
+        apply_slice_grouping,
+    )
+
     for name in _DIM_SCHEMAS:
         _load_dim(con, name, dim_paths)
 
@@ -383,6 +403,12 @@ def stage_a_load_registry(con, dim_paths: dict) -> None:
     con.execute(
         "UPDATE canonical_models SET parent_model_id = variant_parent_id_udf(parents)"
     )
+
+    _composites, _families, promotions = taxonomy.load_and_materialise(
+        con, registry_root, taxonomy_seed_dir,
+    )
+
+    apply_slice_grouping(con, promote_to_benchmark=promotions)
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +444,13 @@ def stage_b_explode_evaluation_results(con) -> int:
         SELECT
             e.evaluation_id,
             e.retrieved_timestamp,
+            -- Top-level evaluation_timestamp on the EEE record:
+            -- "Timestamp for when the evaluation was run" per the
+            -- vendored Pydantic schema. Distinct from
+            -- retrieved_timestamp (snapshot ingestion time). Carried
+            -- through here so Stage D can prefer it over the scrape
+            -- time when populating fact_results.evaluation_timestamp.
+            e.evaluation_timestamp                                AS record_evaluation_timestamp,
             e.source_metadata,
             e.eval_library,
             e.model_info,
@@ -429,7 +462,11 @@ def stage_b_explode_evaluation_results(con) -> int:
             e.evaluation_results[idx_1based].source_data          AS source_data,
             e.evaluation_results[idx_1based].metric_config        AS metric_config,
             e.evaluation_results[idx_1based].score_details        AS score_details,
-            e.evaluation_results[idx_1based].generation_config    AS generation_config
+            e.evaluation_results[idx_1based].generation_config    AS generation_config,
+            -- Per-result evaluation_timestamp — preferred over the
+            -- record-level field when the source disagrees across
+            -- evaluation_results[] entries.
+            e.evaluation_results[idx_1based].evaluation_timestamp AS result_evaluation_timestamp
         FROM eee_raw e,
              range(1, len(e.evaluation_results) + 1) AS t(idx_1based)
         WHERE e.evaluation_results IS NOT NULL
@@ -620,12 +657,31 @@ def stage_d_join_dims_and_flatten(con) -> None:
             -- LEFT JOIN dims, then call the metric-meta hotfix UDF once per row
             -- so its STRUCT result can be destructured cleanly in the outer SELECT
             -- (single UDF invocation per row, not five).
+            --
+            -- composite_slug joins on the source_config curated map (per
+            -- evalcard-registry/seed/composites.yaml). Default fallback for
+            -- non-curated configs is kebab-case(source_config); display
+            -- name falls back to the leaderboard's source_name on EEE
+            -- source_metadata (the human-facing label upstream actually
+            -- emits) so a brand-new uncurated config still renders.
             SELECT
                 rr.*,
                 cb.parent_benchmark_id                                 AS _cb_parent_benchmark_id,
                 cm_model.parent_model_id                               AS _cm_parent_model_id,
                 c.card                                                 AS _card_payload,
                 CASE WHEN c.card IS NOT NULL THEN rr.benchmark_id ELSE NULL END AS _benchmark_card_id,
+                COALESCE(
+                    ccm.composite_slug,
+                    trim(both '-' from regexp_replace(
+                        regexp_replace(lower(rr.source_config), '_', '-', 'g'),
+                        '[^a-z0-9-]+', '-', 'g'
+                    ))
+                )                                                      AS _composite_slug,
+                COALESCE(
+                    ccm.composite_display_name,
+                    rr.source_metadata.source_name,
+                    rr.source_config
+                )                                                      AS _composite_display_name,
                 derive_metric_meta_udf(
                     to_json(rr.metric_config),
                     cmet.metric_kind, cmet.metric_unit,
@@ -638,6 +694,7 @@ def stage_d_join_dims_and_flatten(con) -> None:
             LEFT JOIN canonical_models     cm_model ON cm_model.id = rr.model_id
             LEFT JOIN canonical_metrics    cmet     ON cmet.id = rr.metric_id
             LEFT JOIN cards_raw            c        ON c.benchmark_id = rr.benchmark_id
+            LEFT JOIN composite_config_map ccm      ON ccm.source_config = rr.source_config
         )
         SELECT
             j.fact_id,
@@ -645,6 +702,29 @@ def stage_d_join_dims_and_flatten(con) -> None:
             -- Carried into Stage E so the fact_id dedup tie-break can keep the
             -- latest record. Stage F.4 EXCLUDEs it before emitting fact_results.
             j.retrieved_timestamp,
+
+            -- evaluation_timestamp = "when did the eval actually run".
+            -- Sourced strictly from EEE's evaluation_timestamp field
+            -- (per EEE Pydantic schema): per-result entry first, then
+            -- the record-level top-level field. NULL when EEE carries
+            -- neither — the snapshot ingestion time
+            -- (retrieved_timestamp) is intentionally NOT used as a
+            -- fallback because it conflates "when the eval ran" with
+            -- "when our pipeline scraped it".
+            COALESCE(
+                NULLIF(j.result_evaluation_timestamp, ''),
+                NULLIF(j.record_evaluation_timestamp, '')
+            )                                                                            AS evaluation_timestamp,
+            -- benchmark_updated = when the source-of-truth (e.g.
+            -- Vals.ai) last refreshed the benchmark itself. Carried on
+            -- ~34% of EEE records via
+            -- source_metadata.additional_details.benchmark_updated;
+            -- distinct semantic from evaluation_timestamp (which is
+            -- per-eval-run) and retrieved_timestamp (pipeline scrape).
+            -- Emitted as its own column so consumers don't have to
+            -- destructure the additional_details JSON to reach it.
+            NULLIF(j.source_metadata.additional_details['benchmark_updated'], '')
+                                                                                          AS benchmark_updated,
 
             j.model_raw,     j.model_id,
             j.benchmark_raw, j.benchmark_id,
@@ -655,6 +735,10 @@ def stage_d_join_dims_and_flatten(con) -> None:
 
             j._cb_parent_benchmark_id                                                   AS parent_benchmark_id,
             j._cm_parent_model_id                                                       AS parent_model_id,
+
+            j._composite_slug                                                           AS composite_slug,
+            j._composite_display_name                                                   AS composite_display_name,
+            j.source_config                                                             AS source_config,
 
             j._benchmark_card_id                                                        AS benchmark_card_id,
 
@@ -1098,23 +1182,163 @@ def snapshot_id_to_sql(snapshot_id: str) -> str:
     return snapshot_id[:-1] if snapshot_id.endswith("Z") else snapshot_id
 
 
+def ts_cast_sql(column_expr: str) -> str:
+    """Return the SQL expression that coerces a `retrieved_timestamp`
+    value to a TIMESTAMP. EEE's schema declares the field as a
+    `format: date-time` string, but in practice upstream sources also
+    emit numeric Unix-epoch values (e.g. `1775549757.575894`). A bare
+    `TRY_CAST(x AS TIMESTAMP)` only parses ISO strings — epoch numerics
+    fail and silently land as NULL, which is what produces the
+    "Updated: Unknown" rendering on every evaluation page.
+
+    The COALESCE chain tries ISO first, then falls back to interpreting
+    the value as a Unix-epoch double via `to_timestamp(...)`. NULL in
+    both branches preserves NULL.
+    """
+    return (
+        f"COALESCE("
+        f"TRY_CAST({column_expr} AS TIMESTAMP), "
+        f"TRY_CAST(to_timestamp(TRY_CAST({column_expr} AS DOUBLE)) AS TIMESTAMP)"
+        f")"
+    )
+
+
 # ---------------------------------------------------------------------------
-# Stage G — dim tables (benchmarks, models)
+# Stage G — dim tables (benchmarks, composites, families, models)
 # ---------------------------------------------------------------------------
+
+
+def _synthesise_phantom_benchmarks(con) -> int:
+    """Add canonical_benchmarks rows for stems referenced as
+    parent_benchmark_id but missing as id.
+
+    When ≥2 siblings share a stem and no bare-stem canonical exists
+    (e.g. `caparena-*` with no bare `caparena`), the slice-grouping
+    pass sets `parent_benchmark_id = caparena` on every sibling. This
+    helper materialises a synthetic row with that key, display name
+    derived from the longest common prefix of slice display names
+    (falling back to a title-cased stem), and tags as the union of
+    slice tags. Inserted into canonical_benchmarks so the rest of
+    Stage G doesn't need a UNION-with-phantoms code path.
+
+    Returns the number of synthetic rows inserted.
+    """
+    rows = con.execute(
+        """
+        WITH phantom_stems AS (
+            SELECT DISTINCT cb.parent_benchmark_id AS stem
+            FROM canonical_benchmarks cb
+            WHERE cb.parent_benchmark_id IS NOT NULL
+              AND cb.parent_benchmark_id != cb.id
+              AND NOT EXISTS (
+                  SELECT 1 FROM canonical_benchmarks cb2
+                  WHERE cb2.id = cb.parent_benchmark_id
+              )
+        )
+        SELECT
+            ps.stem,
+            ARRAY_AGG(cb.display_name ORDER BY cb.id)
+                FILTER (WHERE cb.display_name IS NOT NULL) AS member_names,
+            ARRAY_AGG(cb.tags ORDER BY cb.id)
+                FILTER (WHERE cb.tags IS NOT NULL)         AS member_tags
+        FROM phantom_stems ps
+        JOIN canonical_benchmarks cb ON cb.parent_benchmark_id = ps.stem
+        GROUP BY ps.stem
+        """
+    ).fetchall()
+    if not rows:
+        return 0
+
+    # Late import to avoid a hard dep on sidecars from stages.
+    from eval_card_backend.canonicalise.sidecars import (
+        _common_prefix,
+        _title_case_stem,
+    )
+
+    insert_rows: list[tuple[str, str, str | None]] = []
+    for stem, names, tag_jsons in rows:
+        names = names or []
+        display = ""
+        if len(names) >= 2:
+            display = _common_prefix(names) or ""
+        if not display or len(display) < 2:
+            display = _title_case_stem(stem)
+        # Union of tags across slices. Each slice's tags column is a
+        # JSON array string; parse, union, re-serialise.
+        merged: set[str] = set()
+        for tj in (tag_jsons or []):
+            try:
+                import json as _j
+                items = _j.loads(tj) if tj else []
+                if isinstance(items, list):
+                    merged.update(str(x) for x in items)
+            except Exception:
+                continue
+        tags_json = None
+        if merged:
+            import json as _j
+            tags_json = _j.dumps(sorted(merged))
+        insert_rows.append((stem, display, tags_json))
+
+    con.executemany(
+        "INSERT INTO canonical_benchmarks (id, display_name, tags) "
+        "VALUES (?, ?, ?)",
+        insert_rows,
+    )
+    log.info(
+        "Stage G: synthesised %d phantom-stem benchmark(s) for siblings "
+        "missing a bare-stem canonical row.", len(insert_rows),
+    )
+    return len(insert_rows)
+
+
+def _synthesise_singleton_families(con) -> None:
+    """Ensure family_membership has a row for every *root* benchmark.
+
+    A singleton family is `{family_id == benchmark_id, display_name ==
+    benchmark.display_name}`. The curated YAML only carries multi-
+    benchmark families; this helper fills in the long tail.
+
+    Slice rows (parent_benchmark_id != id) are excluded — their family
+    comes from the root benchmark, looked up at dim materialisation
+    time. Without the filter, slice ids like `gaia-level-1` would land
+    as their own singleton families and clutter the families[] index.
+    """
+    con.execute(
+        """
+        INSERT INTO family_membership (family_id, family_display_name, benchmark_id)
+        SELECT cb.id, COALESCE(cb.display_name, cb.id), cb.id
+        FROM canonical_benchmarks cb
+        WHERE cb.id IS NOT NULL
+          AND (cb.parent_benchmark_id IS NULL OR cb.parent_benchmark_id = cb.id)
+          AND cb.id NOT IN (SELECT benchmark_id FROM family_membership)
+        """
+    )
 
 
 def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
+    """Materialise four dim tables:
+      - `benchmarks` keyed on (composite_slug, benchmark_id) — one row per
+        (composite, benchmark) appearance, plus is_slice rows for slice
+        cuts (gaia-level-1 etc.).
+      - `composites` — one row per composite_slug with display name +
+        config list.
+      - `families` — one row per family_id with display name + member
+        list.
+      - `models` — unchanged from the legacy shape.
+    """
     sid = snapshot_id_to_sql(snapshot_id)
 
-    # benchmarks.parquet — accesses card subfields via JSON path so missing
-    # struct fields don't raise; the card schema is heterogeneous across the
-    # cards corpus (some carry _generated_by / flagged_fields, some don't).
-    #
-    # `card_missing_per_benchmark` aggregates the autobenchmarkcard.* gap
-    # once per benchmark so the outer SELECT is a deterministic JOIN. A
-    # naive LIMIT-1 correlated subquery picks an arbitrary fact row, which
-    # breaks byte-stable reproducibility across re-runs even though every
-    # row for the same benchmark carries the same card_payload.
+    _synthesise_phantom_benchmarks(con)
+    _synthesise_singleton_families(con)
+
+    # ---- benchmarks dim ---------------------------------------------------
+    # Per-(composite_slug, benchmark_id). Card columns and registry meta
+    # are per-benchmark (independent of composite) so they're duplicated
+    # across each (composite, benchmark) row. Slice rows materialise inline
+    # with is_slice=TRUE; for slices `benchmark_id` is the slice's own id
+    # and `parent_benchmark_id` points at the root (e.g. gaia-level-1
+    # carries parent_benchmark_id='gaia').
     con.execute(
         f"""
         CREATE TABLE benchmarks AS
@@ -1131,15 +1355,99 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             FROM fact_results
             WHERE benchmark_id IS NOT NULL
             GROUP BY benchmark_id
+        ),
+        base_pairs AS (
+            -- Distinct (composite, benchmark) pairs from fact_results.
+            SELECT DISTINCT composite_slug, benchmark_id
+            FROM fact_results
+            WHERE composite_slug IS NOT NULL
+              AND benchmark_id   IS NOT NULL
+        ),
+        composite_displays AS (
+            SELECT
+                composite_slug,
+                ANY_VALUE(composite_display_name) AS composite_display_name
+            FROM fact_results
+            WHERE composite_slug IS NOT NULL
+            GROUP BY composite_slug
+        ),
+        phantom_root_pairs AS (
+            -- Phantom stems (e.g. arc-agi, caparena) referenced as
+            -- parent_benchmark_id by ≥2 children but with no own fact
+            -- rows. Stage G has already inserted them into
+            -- canonical_benchmarks via _synthesise_phantom_benchmarks,
+            -- but they don't appear in `base_pairs` because they have
+            -- no fact rows themselves. Without this UNION the children
+            -- would be orphan slices in the hierarchy (no root).
+            SELECT DISTINCT bp.composite_slug, cb.parent_benchmark_id AS benchmark_id
+            FROM base_pairs bp
+            JOIN canonical_benchmarks cb ON cb.id = bp.benchmark_id
+            WHERE cb.parent_benchmark_id IS NOT NULL
+              AND cb.parent_benchmark_id != cb.id
+              AND NOT EXISTS (
+                  SELECT 1 FROM base_pairs bp2
+                  WHERE bp2.composite_slug = bp.composite_slug
+                    AND bp2.benchmark_id = cb.parent_benchmark_id
+              )
+        ),
+        composite_benchmark_pairs AS (
+            SELECT
+                ap.composite_slug,
+                cd.composite_display_name,
+                ap.benchmark_id
+            FROM (
+                SELECT * FROM base_pairs
+                UNION
+                SELECT * FROM phantom_root_pairs
+            ) ap
+            LEFT JOIN composite_displays cd USING (composite_slug)
+        ),
+        is_slice_flag AS (
+            -- A canonical id is a slice when its parent points at a
+            -- *different* benchmark id. Self-parented bare stems (e.g.
+            -- gaia → gaia) stay non-slices: they're the root benchmark
+            -- with a phantom-or-explicit stem reference.
+            SELECT
+                cb.id AS benchmark_id,
+                (cb.parent_benchmark_id IS NOT NULL
+                 AND cb.parent_benchmark_id != cb.id) AS is_slice
+            FROM canonical_benchmarks cb
+        ),
+        family_lookup AS (
+            -- For non-slice rows, look up family directly. For slice
+            -- rows (parent != self), inherit the root's family so
+            -- gaia-level-1 lands in the same family as gaia. The
+            -- COALESCE picks the slice's parent if set; otherwise the
+            -- benchmark's own id (which family_membership has a
+            -- singleton entry for after _synthesise_singleton_families).
+            SELECT
+                cb.id AS benchmark_id,
+                COALESCE(fm.family_id,         cb.id)                AS family_id,
+                COALESCE(fm.family_display_name,
+                         cb.display_name, cb.id)                     AS family_display_name
+            FROM canonical_benchmarks cb
+            LEFT JOIN family_membership fm
+              ON fm.benchmark_id = CASE
+                  WHEN cb.parent_benchmark_id IS NOT NULL
+                       AND cb.parent_benchmark_id != cb.id
+                  THEN cb.parent_benchmark_id
+                  ELSE cb.id
+                 END
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
+            cbp.composite_slug,
+            cbp.composite_display_name,
             cb.id AS benchmark_id,
 
-            cb.display_name,
+            COALESCE(cb.display_name, cb.id)                     AS display_name,
+            COALESCE(cb.display_name, cb.id)                     AS benchmark_display_name,
             cb.description,
             cb.dataset_repo,
             cb.parent_benchmark_id,
+            fl.family_id,
+            fl.family_display_name,
+            COALESCE(isf.is_slice, FALSE)                        AS is_slice,
             TRY_CAST(from_json(cb.tags, '["VARCHAR"]') AS VARCHAR[]) AS registry_tags,
             TRY_CAST(cb.metadata AS JSON) AS registry_metadata,
             cb.review_status,
@@ -1190,11 +1498,83 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             COALESCE(len(json_keys(json_extract(c.card_j, '$.flagged_fields'))), 0) AS card_flagged_count,
             cmpb.card_missing_count
 
-        FROM canonical_benchmarks cb
+        FROM composite_benchmark_pairs cbp
+        JOIN canonical_benchmarks cb              ON cb.id = cbp.benchmark_id
         LEFT JOIN cards_json c                    ON c.benchmark_id = cb.id
         LEFT JOIN card_missing_per_benchmark cmpb ON cmpb.benchmark_id = cb.id
-        WHERE cb.id IN (SELECT DISTINCT benchmark_id FROM fact_results
-                        WHERE benchmark_id IS NOT NULL)
+        LEFT JOIN family_lookup fl                ON fl.benchmark_id = cb.id
+        LEFT JOIN is_slice_flag isf               ON isf.benchmark_id = cb.id
+        """
+    )
+
+    # ---- composites dim --------------------------------------------------
+    # One row per composite_slug that has at least one resolved
+    # benchmark in the benchmarks dim. Composites whose fact rows are
+    # entirely unresolved (registry resolver gap) are excluded so the
+    # frontend doesn't render hollow tiles. configs[] is the list of EEE
+    # source_configs that funnel into this composite. evals_count = sum
+    # of distinct (benchmark, metric) triples across the composite.
+    con.execute(
+        f"""
+        CREATE TABLE composites AS
+        WITH composite_configs AS (
+            SELECT
+                fr.composite_slug,
+                ANY_VALUE(fr.composite_display_name) AS composite_display_name,
+                ARRAY_AGG(DISTINCT fr.source_config)
+                    FILTER (WHERE fr.source_config IS NOT NULL) AS source_configs,
+                COUNT(DISTINCT (fr.benchmark_id, fr.metric_id))
+                    FILTER (WHERE fr.benchmark_id IS NOT NULL
+                            AND fr.metric_id    IS NOT NULL)    AS evals_count
+            FROM fact_results fr
+            WHERE fr.composite_slug IS NOT NULL
+            GROUP BY fr.composite_slug
+        ),
+        live_composites AS (
+            SELECT DISTINCT composite_slug FROM benchmarks
+        )
+        SELECT
+            TIMESTAMP '{sid}' AS snapshot_id,
+            cc.composite_slug,
+            cc.composite_display_name,
+            cc.source_configs,
+            cc.evals_count
+        FROM composite_configs cc
+        JOIN live_composites lc USING (composite_slug)
+        ORDER BY cc.composite_slug
+        """
+    )
+
+    # ---- families dim ----------------------------------------------------
+    # One row per family_id (curated multi-benchmark families + singleton
+    # default families). member_benchmark_keys lists every benchmark id in
+    # the family that's actually represented in fact_results for this
+    # snapshot — a curated family member that hasn't shown up yet drops
+    # off the list rather than appearing with zero data behind it.
+    con.execute(
+        f"""
+        CREATE TABLE families AS
+        WITH used_benchmarks AS (
+            SELECT DISTINCT benchmark_id FROM fact_results
+            WHERE benchmark_id IS NOT NULL
+        ),
+        family_members AS (
+            SELECT
+                fm.family_id,
+                ANY_VALUE(fm.family_display_name) AS family_display_name,
+                ARRAY_AGG(DISTINCT fm.benchmark_id ORDER BY fm.benchmark_id)
+                    AS member_benchmark_keys
+            FROM family_membership fm
+            JOIN used_benchmarks ub ON ub.benchmark_id = fm.benchmark_id
+            GROUP BY fm.family_id
+        )
+        SELECT
+            TIMESTAMP '{sid}' AS snapshot_id,
+            family_id,
+            family_display_name,
+            member_benchmark_keys
+        FROM family_members
+        ORDER BY family_id
         """
     )
 
@@ -1265,8 +1645,10 @@ def stage_i_emit_warehouse_parquets(con, out_dir: Path, snapshot_id: str) -> Non
     out_dir.mkdir(parents=True, exist_ok=True)
     sid = snapshot_id_to_sql(snapshot_id)
     for table, sort_key in [
-        ("fact_results", "(model_key, benchmark_id, metric_id)"),
-        ("benchmarks", "(benchmark_id)"),
+        ("fact_results", "(composite_slug, model_key, benchmark_id, metric_id)"),
+        ("benchmarks", "(composite_slug, benchmark_id)"),
+        ("composites", "(composite_slug)"),
+        ("families", "(family_id)"),
         ("models", "(model_key)"),
     ]:
         path = out_dir / f"{table}.parquet"
@@ -1353,8 +1735,8 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
     aggregate_components_type = (
         "STRUCT("
         "evaluation_id VARCHAR,"
-        "composite_benchmark_key VARCHAR,"
-        "composite_benchmark_name VARCHAR,"
+        "composite_slug VARCHAR,"
+        "composite_display_name VARCHAR,"
         "score DOUBLE,"
         "normalized_score DOUBLE,"
         "evaluation_timestamp TIMESTAMP,"
@@ -1369,12 +1751,13 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
         f"""
         CREATE TABLE eval_results_view AS
         WITH benchmark_categories AS (
-            -- Call categorise_benchmark_udf once per benchmark, not once
-            -- per triple. Without this CTE the UDF crosses the Python
-            -- boundary for every (model, benchmark, metric) row in the
-            -- view — wasted work since the input is constant per benchmark.
+            -- Call categorise_benchmark_udf once per (composite, benchmark),
+            -- not once per triple. Without this CTE the UDF crosses the
+            -- Python boundary for every (model, benchmark, metric) row in
+            -- the view — wasted work since the input is constant per
+            -- (composite, benchmark) row in the dim.
             SELECT
-                benchmark_id,
+                composite_slug, benchmark_id,
                 categorise_benchmark_udf(domains, tasks, registry_tags) AS category
             FROM benchmarks
         ),
@@ -1382,15 +1765,19 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             -- Unresolved models (model_id IS NULL) still flow through:
             -- group/partition/join keys all use `model_key` which is
             -- `COALESCE(model_id, model_raw)` and non-null by construction.
+            -- Triples are now (composite_slug, model_key, benchmark_id,
+            -- metric_id) — same benchmark reported in two composites
+            -- becomes two rows in the view.
             SELECT *
             FROM fact_results
-            WHERE model_key    IS NOT NULL
-              AND benchmark_id IS NOT NULL
-              AND metric_id    IS NOT NULL
+            WHERE model_key       IS NOT NULL
+              AND benchmark_id    IS NOT NULL
+              AND metric_id       IS NOT NULL
+              AND composite_slug  IS NOT NULL
         ),
         tri_agg AS (
             SELECT
-                model_key, model_id, benchmark_id, metric_id,
+                composite_slug, model_key, model_id, benchmark_id, metric_id,
                 CAST(COUNT(*) AS INTEGER) AS fact_row_count,
                 -- Median rule: prefer first-party scores; fall back to all rows.
                 COALESCE(
@@ -1443,14 +1830,14 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             -- model_id is functionally dependent on model_key (model_key =
             -- COALESCE(model_id, model_raw)), so grouping by both keeps
             -- cardinality identical and lets the SELECT pass model_id through.
-            GROUP BY model_key, model_id, benchmark_id, metric_id
+            GROUP BY composite_slug, model_key, model_id, benchmark_id, metric_id
         ),
         tri_rep_ranked AS (
             -- Pick one representative fact row per triple.
             -- Order: scored rows first → first-party first → lowest evaluation_id.
             SELECT *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY model_key, benchmark_id, metric_id
+                    PARTITION BY composite_slug, model_key, benchmark_id, metric_id
                     ORDER BY
                         CASE WHEN score IS NULL THEN 1 ELSE 0 END ASC,
                         CASE WHEN evaluator_relationship = 'first_party' THEN 0 ELSE 1 END ASC,
@@ -1467,6 +1854,8 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 tr.evaluation_id              AS rep_evaluation_id,
                 tr.fact_id                    AS rep_fact_id,
                 tr.retrieved_timestamp        AS rep_retrieved_timestamp,
+                tr.evaluation_timestamp       AS rep_evaluation_timestamp,
+                tr.benchmark_updated          AS rep_benchmark_updated,
                 tr.evaluator_relationship     AS rep_evaluator_relationship,
                 tr.provenance_source_type     AS rep_provenance_source_type,
                 tr.org_raw                    AS rep_org_raw,
@@ -1498,23 +1887,30 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 m.open_weights                AS m_open_weights,
                 cmet.display_name             AS metric_display_name,
                 b.parent_benchmark_id         AS b_parent_benchmark_id,
+                b.composite_display_name      AS b_composite_display_name,
+                b.family_id                   AS b_family_id,
+                b.family_display_name         AS b_family_display_name,
+                b.is_slice                    AS b_is_slice,
                 bc.category                   AS b_category
             FROM tri_agg ta
-            JOIN tri_rep tr USING (model_key, benchmark_id, metric_id)
+            JOIN tri_rep tr USING (composite_slug, model_key, benchmark_id, metric_id)
             LEFT JOIN models m              ON m.model_key    = ta.model_key
-            LEFT JOIN benchmarks b          ON b.benchmark_id = ta.benchmark_id
-            LEFT JOIN benchmark_categories bc ON bc.benchmark_id = ta.benchmark_id
+            LEFT JOIN benchmarks b          ON b.composite_slug = ta.composite_slug
+                                            AND b.benchmark_id  = ta.benchmark_id
+            LEFT JOIN benchmark_categories bc ON bc.composite_slug = ta.composite_slug
+                                              AND bc.benchmark_id  = ta.benchmark_id
             LEFT JOIN canonical_metrics cmet ON cmet.id       = ta.metric_id
         ),
         ranked AS (
-            -- Rank by score within (benchmark_id, metric_id), honouring
-            -- lower_is_better. NULL scores sort last and get position=NULL.
-            -- COUNT(rep_score) over the partition counts non-NULL scores.
+            -- Rank by score within (composite_slug, benchmark_id, metric_id),
+            -- honouring lower_is_better. NULL scores sort last and get
+            -- position=NULL. COUNT(rep_score) over the partition counts
+            -- non-NULL scores.
             SELECT *,
                 CASE
                     WHEN rep_score IS NULL THEN NULL
                     ELSE CAST(ROW_NUMBER() OVER (
-                        PARTITION BY benchmark_id, metric_id
+                        PARTITION BY composite_slug, benchmark_id, metric_id
                         ORDER BY
                             CASE WHEN rep_score IS NULL THEN 1 ELSE 0 END ASC,
                             CASE WHEN COALESCE(rep_lower_is_better, FALSE)
@@ -1525,15 +1921,20 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                     ) AS INTEGER)
                 END AS position,
                 CAST(COUNT(rep_score) OVER (
-                    PARTITION BY benchmark_id, metric_id
+                    PARTITION BY composite_slug, benchmark_id, metric_id
                 ) AS INTEGER) AS total
             FROM joined
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
-            url_encode_udf(benchmark_id)                         AS evaluation_id,
+            url_encode_udf(composite_slug || '/' || benchmark_id) AS evaluation_id,
             metric_summary_id_udf(benchmark_id, metric_id)       AS metric_summary_id,
+            composite_slug,
+            b_composite_display_name                             AS composite_display_name,
             benchmark_id,
+            b_family_id                                          AS family_id,
+            b_family_display_name                                AS family_display_name,
+            COALESCE(b_is_slice, FALSE)                          AS is_slice,
             metric_id,
             model_key,
             model_id,
@@ -1595,10 +1996,21 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 ELSE 1.0 - (position - 1.0) / (total - 1.0)
             END AS percentile,
 
-            -- TRY_CAST so a malformed timestamp string yields NULL instead of erroring
-            -- the whole snapshot. fact_results carries retrieved_timestamp as VARCHAR
-            -- (EEE schema declares it `format: date-time` over `type: string`).
-            TRY_CAST(rep_retrieved_timestamp AS TIMESTAMP)        AS evaluation_timestamp,
+            -- evaluation_timestamp is the actual eval-run time
+            -- (sourced from EEE evaluation_timestamp, NOT
+            -- retrieved_timestamp which is just our scrape time).
+            -- ts_cast_sql handles both ISO date-time strings and
+            -- Unix-epoch numerics — upstream EEE sources emit both
+            -- forms. NULL when the source carries no eval-run timestamp.
+            {ts_cast_sql("rep_evaluation_timestamp")}             AS evaluation_timestamp,
+            -- benchmark_updated: when the source last refreshed the
+            -- benchmark itself (vs when this specific eval ran).
+            -- Carried on a subset of EEE records; NULL elsewhere.
+            {ts_cast_sql("rep_benchmark_updated")}                AS benchmark_updated,
+            -- retrieved_timestamp preserved for diagnostics — when the
+            -- snapshot pipeline scraped this record. Frontend should
+            -- prefer evaluation_timestamp for "Updated"/eval-date UX.
+            {ts_cast_sql("rep_retrieved_timestamp")}              AS retrieved_timestamp,
 
             CAST({{
                 'source_name':              rep_org_raw,
@@ -1731,8 +2143,11 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                 CAST(COUNT(*) FILTER (
                     WHERE NOT (has_temperature AND has_top_p AND has_max_tokens)
                 ) AS INTEGER)                                AS missing_generation_config_count,
-                MAX(TRY_CAST(retrieved_timestamp AS TIMESTAMP)) AS latest_timestamp,
-                arg_max(org_raw, TRY_CAST(retrieved_timestamp AS TIMESTAMP))
+                -- latest_timestamp = latest of the model's actual
+                -- eval-run timestamps (NOT scrape times). NULL when
+                -- none of this model's evaluations carry timestamps.
+                MAX({ts_cast_sql("evaluation_timestamp")}) AS latest_timestamp,
+                arg_max(org_raw, {ts_cast_sql("evaluation_timestamp")})
                     FILTER (WHERE org_raw IS NOT NULL)        AS latest_source_name,
                 CAST(COUNT(DISTINCT org_id) FILTER (WHERE org_id IS NOT NULL) AS BIGINT)
                                                               AS evaluator_count,
@@ -1806,7 +2221,9 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                 ARRAY_AGG(DISTINCT b.display_name)
                     FILTER (WHERE b.display_name IS NOT NULL) AS benchmark_names
             FROM eval_results_view erv
-            LEFT JOIN benchmarks b ON b.benchmark_id = erv.benchmark_id
+            LEFT JOIN benchmarks b
+              ON b.composite_slug = erv.composite_slug
+             AND b.benchmark_id   = erv.benchmark_id
             GROUP BY 1
         ),
         ranked_for_top AS (
@@ -1827,7 +2244,9 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                         erv.evaluation_id ASC
                 ) AS _rk
             FROM eval_results_view erv
-            LEFT JOIN benchmarks b ON b.benchmark_id = erv.benchmark_id
+            LEFT JOIN benchmarks b
+              ON b.composite_slug = erv.composite_slug
+             AND b.benchmark_id   = erv.benchmark_id
             WHERE erv.score IS NOT NULL
               AND erv.category IS NOT NULL
         ),
@@ -2071,10 +2490,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
         f"""
         CREATE TABLE evals_view AS
         WITH per_metric AS (
-            -- One row per (benchmark_id, metric_id). Carries metric meta + counts
-            -- + lower_is_better-aware top score in a single scan of
-            -- eval_results_view (vs a separate per_metric_top pass).
+            -- One row per (composite_slug, benchmark_id, metric_id).
+            -- Carries metric meta + counts + lower_is_better-aware top
+            -- score in a single scan of eval_results_view.
             SELECT
+                erv.composite_slug,
                 erv.benchmark_id,
                 erv.metric_id,
                 ANY_VALUE(erv.metric_display_name) AS metric_display_name,
@@ -2084,16 +2504,17 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 CASE WHEN COALESCE(ANY_VALUE(erv.lower_is_better), FALSE)
                      THEN MIN(erv.score) ELSE MAX(erv.score) END AS top_score
             FROM eval_results_view erv
-            GROUP BY 1, 2
+            GROUP BY 1, 2, 3
         ),
         primary_metric AS (
-            -- Pick one metric per benchmark: most-covered (tie-break on metric_id).
-            SELECT benchmark_id, metric_id, metric_display_name,
+            -- Pick one metric per (composite, benchmark): most-covered
+            -- (tie-break on metric_id).
+            SELECT composite_slug, benchmark_id, metric_id, metric_display_name,
                    metric_unit, lower_is_better, top_score
             FROM (
                 SELECT pm.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY benchmark_id
+                           PARTITION BY composite_slug, benchmark_id
                            ORDER BY metric_models_count DESC, metric_id ASC
                        ) AS _rk
                 FROM per_metric pm
@@ -2111,32 +2532,33 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 END AS scoring_score
             FROM eval_results_view erv
             JOIN primary_metric pm
-              ON pm.benchmark_id = erv.benchmark_id
-             AND pm.metric_id    = erv.metric_id
+              ON pm.composite_slug = erv.composite_slug
+             AND pm.benchmark_id   = erv.benchmark_id
+             AND pm.metric_id      = erv.metric_id
         ),
         evaluator_names_agg AS (
-            -- Distinct org names across primary-metric triples for this benchmark.
-            -- Done in a separate CTE so the unnest doesn't inflate the per-triple
-            -- aggregations in `primary_facts`.
-            SELECT pt.benchmark_id,
+            -- Distinct org names across primary-metric triples for this
+            -- (composite, benchmark). Done in a separate CTE so the
+            -- unnest doesn't inflate the per-triple aggregations.
+            SELECT pt.composite_slug, pt.benchmark_id,
                    ARRAY_AGG(DISTINCT u) FILTER (WHERE u IS NOT NULL) AS evaluator_names
             FROM primary_triples pt,
                  UNNEST(COALESCE(pt.reporting_orgs, [])) AS u_t(u)
-            GROUP BY 1
+            GROUP BY 1, 2
         ),
         source_types_agg AS (
-            SELECT pt.benchmark_id,
+            SELECT pt.composite_slug, pt.benchmark_id,
                    ARRAY_AGG(DISTINCT t) FILTER (WHERE t IS NOT NULL) AS source_types
             FROM primary_triples pt,
                  UNNEST(COALESCE(pt.evaluator_relationships, [])) AS t_t(t)
-            GROUP BY 1
+            GROUP BY 1, 2
         ),
         primary_facts AS (
-            -- Per-benchmark scalars over the primary metric's triples.
-            -- One row per triple — no cross-join unnest here, so SUMs and
-            -- COUNTs are accurate.
+            -- Per-(composite, benchmark) scalars over the primary
+            -- metric's triples. One row per triple — no cross-join
+            -- unnest here, so SUMs and COUNTs are accurate.
             SELECT
-                pt.benchmark_id,
+                pt.composite_slug, pt.benchmark_id,
                 CAST(COUNT(DISTINCT pt.model_key) AS BIGINT)           AS models_count,
                 arg_max(pt.source_metadata.source_organization_name,
                         pt.evaluation_timestamp)                       AS latest_source_name,
@@ -2174,10 +2596,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 CAST(SUM(CASE WHEN pt.has_cross_party_divergence IS NOT NULL THEN 1 ELSE 0 END) AS INTEGER)
                                                                        AS groups_with_cross_party_check
             FROM primary_triples pt
-            GROUP BY pt.benchmark_id
+            GROUP BY pt.composite_slug, pt.benchmark_id
         ),
         leaderboard_metrics_agg AS (
             SELECT
+                pm.composite_slug,
                 pm.benchmark_id,
                 CAST(COUNT(*) AS INTEGER) AS metrics_count,
                 ARRAY_AGG(pm.metric_display_name ORDER BY pm.metric_id)
@@ -2209,12 +2632,14 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     unit                   := pm.metric_unit
                 ) ORDER BY pm.metric_id) AS root_metrics
             FROM per_metric pm
-            GROUP BY pm.benchmark_id
+            GROUP BY pm.composite_slug, pm.benchmark_id
         ),
         leaderboard_per_model AS (
-            -- One row per (benchmark_id, model_key) carrying its values map across
-            -- all metrics on that benchmark.
+            -- One row per (composite_slug, benchmark_id, model_key)
+            -- carrying its values map across all metrics on that
+            -- (composite, benchmark) pair.
             SELECT
+                erv.composite_slug,
                 erv.benchmark_id,
                 erv.model_key,
                 ANY_VALUE(erv.model_route_id)                  AS model_route_id,
@@ -2228,10 +2653,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 )                                              AS values_map,
                 CAST(COUNT(erv.score) AS INTEGER)              AS metrics_present
             FROM eval_results_view erv
-            GROUP BY 1, 2
+            GROUP BY 1, 2, 3
         ),
         leaderboard_rows_agg AS (
             SELECT
+                composite_slug,
                 benchmark_id,
                 ARRAY_AGG(struct_pack(
                     model_info           := model_info,
@@ -2243,10 +2669,11 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     metrics_present      := metrics_present
                 ) ORDER BY model_key) AS leaderboard_rows
             FROM leaderboard_per_model
-            GROUP BY 1
+            GROUP BY 1, 2
         ),
         instance_summary AS (
             SELECT
+                erv.composite_slug,
                 erv.benchmark_id,
                 CAST(COUNT(DISTINCT erv.instance_file_path)
                      FILTER (WHERE erv.instance_file_path IS NOT NULL) AS BIGINT)
@@ -2259,15 +2686,17 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                      FILTER (WHERE erv.instance_file_path IS NOT NULL) AS INTEGER)
                     AS models_with_loaded_instances
             FROM eval_results_view erv
-            GROUP BY 1
+            GROUP BY 1, 2
         ),
         per_slice_metric AS (
-            -- One row per (benchmark_id, slice_key, metric_id). Reads
-            -- from fact_results because eval_results_view collapses on
-            -- (model_key, benchmark_id, metric_id) and doesn't carry
-            -- slice_key. Mirrors the per_metric CTE above so the
-            -- subtask metrics list matches root_metrics field-for-field.
+            -- One row per (composite_slug, benchmark_id, slice_key, metric_id).
+            -- Reads from fact_results because eval_results_view
+            -- collapses to one row per (composite, model, benchmark,
+            -- metric) and doesn't carry slice_key. Mirrors the
+            -- per_metric CTE so the subtask metrics list matches
+            -- root_metrics field-for-field.
             SELECT
+                fr.composite_slug,
                 fr.benchmark_id,
                 fr.slice_key,
                 fr.metric_id,
@@ -2280,16 +2709,19 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                      THEN MIN(fr.score) ELSE MAX(fr.score) END AS top_score
             FROM fact_results fr
             LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_id
-            WHERE fr.benchmark_id IS NOT NULL
+            WHERE fr.composite_slug IS NOT NULL
+              AND fr.benchmark_id IS NOT NULL
               AND fr.slice_key    IS NOT NULL
               AND fr.metric_id    IS NOT NULL
               AND fr.model_key    IS NOT NULL
-            GROUP BY 1, 2, 3
+            GROUP BY 1, 2, 3, 4
         ),
         slice_metrics_agg AS (
-            -- One row per (benchmark_id, slice_key) — metrics rolled into
-            -- a struct array. Deterministic ordering by metric_id.
+            -- One row per (composite_slug, benchmark_id, slice_key) —
+            -- metrics rolled into a struct array. Deterministic
+            -- ordering by metric_id.
             SELECT
+                composite_slug,
                 benchmark_id,
                 slice_key,
                 MIN(slice_name_rep) AS slice_name_rep,
@@ -2306,11 +2738,13 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                     unit                   := metric_unit
                 ) ORDER BY metric_id) AS metrics
             FROM per_slice_metric
-            GROUP BY benchmark_id, slice_key
+            GROUP BY composite_slug, benchmark_id, slice_key
         ),
         subtasks_agg AS (
-            -- One row per benchmark — slices rolled into a struct array.
+            -- One row per (composite_slug, benchmark_id) — slices rolled
+            -- into a struct array.
             SELECT
+                composite_slug,
                 benchmark_id,
                 ARRAY_AGG(struct_pack(
                     subtask_key            := slice_key,
@@ -2321,21 +2755,21 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                 ) ORDER BY slice_key) AS subtasks,
                 CAST(COUNT(*) AS INTEGER) AS subtasks_count
             FROM slice_metrics_agg
-            GROUP BY benchmark_id
+            GROUP BY composite_slug, benchmark_id
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
-            url_encode_udf(b.benchmark_id)              AS evaluation_id,
+            url_encode_udf(b.composite_slug || '/' || b.benchmark_id) AS evaluation_id,
+            b.composite_slug,
+            b.composite_display_name,
             b.benchmark_id,
+            b.family_id,
+            b.family_display_name,
+            b.is_slice,
             pm.metric_id                                AS primary_metric_id,
 
             b.display_name                              AS evaluation_name,
             b.display_name                              AS canonical_display_name,
-            COALESCE(b.parent_benchmark_id, b.benchmark_id) AS composite_benchmark_key,
-            b.display_name                              AS composite_benchmark_name,
-            COALESCE(b.parent_benchmark_id, b.benchmark_id) AS benchmark_family_key,
-            CASE WHEN b.parent_benchmark_id IS NOT NULL
-                 THEN b.benchmark_id ELSE NULL END      AS benchmark_leaf_key,
             categorise_benchmark_udf(b.domains, b.tasks, b.registry_tags) AS category,
 
             CAST(struct_pack(
@@ -2432,8 +2866,8 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             FALSE                                         AS is_aggregated,
             CAST(NULL AS STRUCT(
                 evaluation_id VARCHAR,
-                composite_benchmark_key VARCHAR,
-                composite_benchmark_name VARCHAR,
+                composite_slug VARCHAR,
+                composite_display_name VARCHAR,
                 models_count INTEGER,
                 avg_score_norm DOUBLE
             )[])                                          AS aggregate_sources,
@@ -2532,18 +2966,26 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             )[])                                         AS subtasks,
             COALESCE(sub.subtasks_count, 0)              AS subtasks_count
         FROM benchmarks b
-        LEFT JOIN primary_metric pm     ON pm.benchmark_id = b.benchmark_id
+        LEFT JOIN primary_metric pm     ON pm.composite_slug = b.composite_slug
+                                        AND pm.benchmark_id  = b.benchmark_id
         LEFT JOIN canonical_metrics cmet ON cmet.id = pm.metric_id
-        LEFT JOIN primary_facts pf      ON pf.benchmark_id = b.benchmark_id
-        LEFT JOIN evaluator_names_agg ena ON ena.benchmark_id = b.benchmark_id
-        LEFT JOIN source_types_agg    sta ON sta.benchmark_id = b.benchmark_id
+        LEFT JOIN primary_facts pf      ON pf.composite_slug = b.composite_slug
+                                        AND pf.benchmark_id  = b.benchmark_id
+        LEFT JOIN evaluator_names_agg ena ON ena.composite_slug = b.composite_slug
+                                          AND ena.benchmark_id  = b.benchmark_id
+        LEFT JOIN source_types_agg    sta ON sta.composite_slug = b.composite_slug
+                                          AND sta.benchmark_id  = b.benchmark_id
         LEFT JOIN models top_m          ON top_m.model_key = pf.top_model_id
         LEFT JOIN models bot_m          ON bot_m.model_key = pf.bottom_model_id
-        LEFT JOIN leaderboard_metrics_agg lma ON lma.benchmark_id = b.benchmark_id
-        LEFT JOIN leaderboard_rows_agg    lra ON lra.benchmark_id = b.benchmark_id
-        LEFT JOIN instance_summary        ins ON ins.benchmark_id = b.benchmark_id
-        LEFT JOIN subtasks_agg            sub ON sub.benchmark_id = b.benchmark_id
-        ORDER BY b.benchmark_id
+        LEFT JOIN leaderboard_metrics_agg lma ON lma.composite_slug = b.composite_slug
+                                              AND lma.benchmark_id  = b.benchmark_id
+        LEFT JOIN leaderboard_rows_agg    lra ON lra.composite_slug = b.composite_slug
+                                              AND lra.benchmark_id  = b.benchmark_id
+        LEFT JOIN instance_summary        ins ON ins.composite_slug = b.composite_slug
+                                              AND ins.benchmark_id  = b.benchmark_id
+        LEFT JOIN subtasks_agg            sub ON sub.composite_slug = b.composite_slug
+                                              AND sub.benchmark_id  = b.benchmark_id
+        ORDER BY b.composite_slug, b.benchmark_id
         """
     )
 
@@ -2557,7 +2999,7 @@ def stage_j_emit_view_parquets(con, out_dir: Path, snapshot_id: str) -> None:
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     for table, sort_key in [
-        ("eval_results_view", "(metric_summary_id, model_key)"),
+        ("eval_results_view", "(composite_slug, metric_summary_id, model_key)"),
         ("models_view",       "(model_key)"),
         ("evals_view",        "(evaluation_id)"),
     ]:

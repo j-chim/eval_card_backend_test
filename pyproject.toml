@@ -11,6 +11,9 @@ dependencies = [
     # pydantic 2.5+ for Discriminator support, used by vendored eee_types.py
     # (validates EEE records at the Stage A boundary).
     "pydantic>=2.5",
+    # PyYAML for the composite/family/slice taxonomy seed (composites.yaml,
+    # families.yaml, slice_overrides.yaml in evalcard-registry/seed/).
+    "pyyaml>=6",
 ]
 
 [project.scripts]

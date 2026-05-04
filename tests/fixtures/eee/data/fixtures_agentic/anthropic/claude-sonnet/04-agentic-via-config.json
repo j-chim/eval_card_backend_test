@@ -2,6 +2,7 @@
   "evaluation_id": "ev_04",
   "schema_version": "0.2.2",
   "retrieved_timestamp": "2026-04-30T00:00:00Z",
+  "evaluation_timestamp": "2026-04-29T00:00:00Z",
   "model_info": {
     "developer": "anthropic",
     "name": "Claude Sonnet",

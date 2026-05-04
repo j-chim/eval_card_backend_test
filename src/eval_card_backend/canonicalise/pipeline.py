@@ -267,7 +267,9 @@ def run(
             n_cards = stages.stage_a_load_cards(con, cards)
             log.info("  loaded %d cards", n_cards)
             dim_paths = registry_src.open_dim_paths(registry_root)
-            stages.stage_a_load_registry(con, dim_paths)
+            stages.stage_a_load_registry(
+                con, dim_paths, registry_root=registry_root,
+            )
             log.info("  registry dims loaded: %s", sorted(dim_paths))
         elif letter == "B":
             n_exploded = stages.stage_b_explode_evaluation_results(con)
@@ -490,6 +492,8 @@ def _build_snapshot_meta(
     tables: list[str] = [
         "fact_results.parquet",
         "benchmarks.parquet",
+        "composites.parquet",
+        "families.parquet",
         "models.parquet",
         "canonical_metrics.parquet",
     ]

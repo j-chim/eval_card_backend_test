@@ -46,7 +46,10 @@ def _materialise_views(out_dir: Path):
     con = duckdb.connect()
     alias_store = registry_src.load_alias_store(FIXTURES / "entity_registry")
     register_udfs(con, Resolver(alias_store))
-    for table in ("fact_results", "benchmarks", "models", "canonical_metrics"):
+    for table in (
+        "fact_results", "benchmarks", "composites", "families", "models",
+        "canonical_metrics",
+    ):
         con.execute(
             f"CREATE TABLE {table} AS "
             f"SELECT * FROM read_parquet('{out_dir}/{table}.parquet')"

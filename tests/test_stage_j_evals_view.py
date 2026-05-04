@@ -46,7 +46,10 @@ def _materialise_views(out_dir: Path):
     con = duckdb.connect()
     alias_store = registry_src.load_alias_store(FIXTURES / "entity_registry")
     register_udfs(con, Resolver(alias_store))
-    for table in ("fact_results", "benchmarks", "models", "canonical_metrics"):
+    for table in (
+        "fact_results", "benchmarks", "composites", "families", "models",
+        "canonical_metrics",
+    ):
         con.execute(
             f"CREATE TABLE {table} AS "
             f"SELECT * FROM read_parquet('{out_dir}/{table}.parquet')"
@@ -65,8 +68,9 @@ def test_evals_view_columns_match_spec(tmp_path, monkeypatch):
     expected = {
         "snapshot_id", "evaluation_id", "benchmark_id", "primary_metric_id",
         "evaluation_name", "canonical_display_name",
-        "composite_benchmark_key", "composite_benchmark_name",
-        "benchmark_family_key", "benchmark_leaf_key", "category",
+        "composite_slug", "composite_display_name",
+        "family_id", "family_display_name", "is_slice",
+        "category",
         "metric_config",
         "models_count", "evaluator_names", "source_types",
         "latest_source_name", "third_party_ratio",
@@ -85,17 +89,24 @@ def test_evals_view_columns_match_spec(tmp_path, monkeypatch):
     }
     missing = expected - cols.keys()
     assert not missing, f"missing columns: {missing}"
+    # Legacy columns removed in the composite/family/slice taxonomy
+    # cutover. Test guards against regression.
+    assert "composite_benchmark_key" not in cols
+    assert "benchmark_family_key" not in cols
+    assert "benchmark_leaf_key" not in cols
 
 
-def test_evaluation_id_round_trips(tmp_path, monkeypatch):
+def test_evaluation_id_is_composite_slash_benchmark(tmp_path, monkeypatch):
+    """evaluation_id is `<composite_slug>/<benchmark_id>` URL-encoded."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_views(out)
     rows = con.execute(
-        "SELECT benchmark_id, evaluation_id FROM evals_view"
+        "SELECT composite_slug, benchmark_id, evaluation_id FROM evals_view"
     ).fetchall()
-    for benchmark_id, slug in rows:
-        assert unquote(slug) == benchmark_id
+    for composite_slug, benchmark_id, slug in rows:
+        # URL-encoded form of "composite_slug/benchmark_id"
+        assert unquote(slug) == f"{composite_slug}/{benchmark_id}"
 
 
 def test_primary_metric_picked_deterministically(tmp_path, monkeypatch):

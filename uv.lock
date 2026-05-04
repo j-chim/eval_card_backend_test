@@ -459,6 +459,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "pyarrow" },
     { name = "pydantic" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -476,6 +477,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = ">=0.24" },
     { name = "pyarrow", specifier = ">=16" },
     { name = "pydantic", specifier = ">=2.5" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [package.metadata.requires-dev]

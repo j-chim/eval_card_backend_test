@@ -32,13 +32,16 @@ STAGE_OUTPUTS: dict[str, tuple[str, ...]] = {
         "canonical_benchmarks",
         "canonical_metrics",
         "eval_harnesses",
+        "composite_config_map",
+        "family_membership",
+        "slice_promotions",
     ),
     "B": ("results_exploded",),
     "C": ("results_resolved",),
     "D": ("fact_results_staging",),
     "E": ("fact_results_signaled",),
     "F": ("fact_results",),
-    "G": ("benchmarks", "models"),
+    "G": ("benchmarks", "composites", "families", "models"),
     "I": (),  # Stage I writes the warehouse parquets; nothing in-memory to cache.
     "J": ("eval_results_view", "models_view", "evals_view"),
 }

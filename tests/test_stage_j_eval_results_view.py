@@ -57,7 +57,10 @@ def _materialise_view(out_dir: Path):
     con = duckdb.connect()
     alias_store = registry_src.load_alias_store(FIXTURES / "entity_registry")
     register_udfs(con, Resolver(alias_store))
-    for table in ("fact_results", "benchmarks", "models", "canonical_metrics"):
+    for table in (
+        "fact_results", "benchmarks", "composites", "families", "models",
+        "canonical_metrics",
+    ):
         con.execute(
             f"CREATE TABLE {table} AS "
             f"SELECT * FROM read_parquet('{out_dir}/{table}.parquet')"
@@ -111,18 +114,19 @@ def test_view_columns_match_spec(tmp_path, monkeypatch):
 
 
 def test_evaluation_id_round_trips_through_unquote(tmp_path, monkeypatch):
-    """evaluation_id is RFC 3986 percent-encoded; unquote recovers the
-    canonical benchmark_id."""
+    """evaluation_id is `<composite_slug>/<benchmark_id>` URL-encoded;
+    unquote recovers the canonical pair separated by `/`."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_view(out)
     rows = con.execute(
-        "SELECT DISTINCT benchmark_id, evaluation_id FROM eval_results_view "
+        "SELECT DISTINCT composite_slug, benchmark_id, evaluation_id "
+        "FROM eval_results_view "
         "WHERE benchmark_id IS NOT NULL"
     ).fetchall()
     assert rows, "no rows produced"
-    for benchmark_id, slug in rows:
-        assert unquote(slug) == benchmark_id
+    for composite_slug, benchmark_id, slug in rows:
+        assert unquote(slug) == f"{composite_slug}/{benchmark_id}"
 
 
 def test_metric_summary_id_round_trips(tmp_path, monkeypatch):

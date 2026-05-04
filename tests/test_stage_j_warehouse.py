@@ -351,14 +351,16 @@ def test_slugs_round_trip_on_warehouse_parquet(tmp_path, monkeypatch):
     con = duckdb.connect()
 
     rows = con.execute(
-        f"SELECT model_id, model_route_id, benchmark_id, evaluation_id, "
-        f"       metric_id, metric_summary_id "
+        f"SELECT model_id, model_route_id, composite_slug, benchmark_id, "
+        f"       evaluation_id, metric_id, metric_summary_id "
         f"FROM read_parquet('{out / 'eval_results_view.parquet'}')"
     ).fetchall()
     assert len(rows) >= 2
-    for model_id, model_route_id, bench_id, eval_id, metric_id, metric_summary_id in rows:
+    for (model_id, model_route_id, composite_slug, bench_id, eval_id,
+         metric_id, metric_summary_id) in rows:
         assert unquote(model_route_id) == model_id
-        assert unquote(eval_id) == bench_id
+        # evaluation_id encodes `<composite_slug>/<benchmark_id>`
+        assert unquote(eval_id) == f"{composite_slug}/{bench_id}"
         assert unquote(metric_summary_id) == f"{bench_id}:{metric_id}"
 
 
@@ -410,7 +412,10 @@ def test_lower_is_better_flips_ranking_direction(tmp_path, monkeypatch):
     # Reuse the warehouse parquets but flip lower_is_better on
     # canonical_metrics — and regenerate fact_results' lower_is_better
     # column so Stage J's ranking SQL reads the flipped direction.
-    for table in ("fact_results", "benchmarks", "models", "canonical_metrics"):
+    for table in (
+        "fact_results", "benchmarks", "composites", "families", "models",
+        "canonical_metrics",
+    ):
         con.execute(
             f"CREATE TABLE {table} AS "
             f"SELECT * FROM read_parquet('{out / f'{table}.parquet'}')"

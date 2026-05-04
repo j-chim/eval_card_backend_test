@@ -53,6 +53,12 @@ def _eee_record(
         "evaluation_id": eval_id,
         "schema_version": "0.2.2",
         "retrieved_timestamp": "2026-04-30T00:00:00Z",
+        # Top-level evaluation_timestamp is what frontends should
+        # display as "Updated"/eval-date — distinct from
+        # retrieved_timestamp (snapshot pipeline scrape time). Stage J
+        # views materialise the former; the latter is preserved on
+        # fact_results for diagnostics + dedup tie-breaks.
+        "evaluation_timestamp": "2026-04-29T00:00:00Z",
         "model_info": {
             "developer": dev, "name": model, "id": model_id,
             "inference_platform": "test",

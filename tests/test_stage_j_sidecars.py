@@ -46,7 +46,10 @@ def _materialise_views_and_sidecars(out_dir: Path):
     con = duckdb.connect()
     alias_store = registry_src.load_alias_store(FIXTURES / "entity_registry")
     register_udfs(con, Resolver(alias_store))
-    for table in ("fact_results", "benchmarks", "models", "canonical_metrics"):
+    for table in (
+        "fact_results", "benchmarks", "composites", "families", "models",
+        "canonical_metrics",
+    ):
         con.execute(
             f"CREATE TABLE {table} AS "
             f"SELECT * FROM read_parquet('{out_dir}/{table}.parquet')"
@@ -116,7 +119,11 @@ def test_headline_top_level_shape(tmp_path, monkeypatch):
         assert "overall" in h[key]
         assert "by_category" in h[key]
     assert "developers" in h
-    assert "families" in h
+    # The model-family rollup got renamed `model_families` (was `families`)
+    # to disambiguate from the benchmark-family taxonomy in hierarchy.json.
+    assert "model_families" in h
+    assert "families" not in h
+    assert "composites" in h
     assert "categories" in h
 
 
@@ -175,61 +182,321 @@ def test_categories_list_typed(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_hierarchy_stats_conservation(tmp_path, monkeypatch):
-    """family_count = composite_count + standalone_benchmark_count."""
+def test_hierarchy_top_level_shape(tmp_path, monkeypatch):
+    """New shape: composites[] (primary tree) + families[] (lookup index)."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
+    assert {"generated_at", "stats", "composites", "families"} <= hi.keys()
     s = hi["stats"]
-    assert s["family_count"] == s["composite_count"] + s["standalone_benchmark_count"]
+    assert {
+        "composite_count", "family_count", "benchmark_count",
+        "slice_count", "metric_count", "metric_rows_scanned",
+    } <= s.keys()
 
 
-def test_hierarchy_families_have_required_keys(tmp_path, monkeypatch):
+def test_hierarchy_composites_have_required_keys(tmp_path, monkeypatch):
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
-    assert hi["families"], "no families in hierarchy"
-    for fam in hi["families"]:
+    assert hi["composites"], "no composites in hierarchy"
+    for c in hi["composites"]:
         assert {
-            "key", "display_name", "category", "has_card", "tags",
-            "evals_count", "eval_summary_ids",
-            "composites", "standalone_benchmarks",
-        } <= fam.keys()
-        # Each family is either composite OR standalone (could be both on
-        # mixed data; v1 fixtures only test the standalone path).
-        assert isinstance(fam["composites"], list)
-        assert isinstance(fam["standalone_benchmarks"], list)
+            "key", "display_name", "category", "tags",
+            "evals_count", "benchmarks",
+        } <= c.keys()
+        assert isinstance(c["benchmarks"], list)
+        for b in c["benchmarks"]:
+            assert {
+                "key", "display_name", "family_id", "is_slice",
+                "tags", "metrics", "slices", "summary_eval_ids",
+            } <= b.keys()
 
 
-def test_hierarchy_standalone_benchmark_path(tmp_path, monkeypatch):
-    """fixtures don't carry parent_benchmark_id → every family is
-    standalone, with one benchmark entry under standalone_benchmarks[]."""
+def test_hierarchy_families_index_shape(tmp_path, monkeypatch):
+    """families[] is a flat lookup: one entry per family_id with the
+    list of member benchmark keys. No nested benchmarks."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
-    fam = hi["families"][0]
-    assert len(fam["composites"]) == 0
-    assert len(fam["standalone_benchmarks"]) == 1
-    leaf = fam["standalone_benchmarks"][0]
-    assert leaf["key"] == fam["key"]
-    assert "metrics" in leaf
-    assert "slices" in leaf  # always present even if empty
+    for fam in hi["families"]:
+        assert {"key", "display_name", "member_benchmark_keys"} <= fam.keys()
+        assert isinstance(fam["member_benchmark_keys"], list)
+        # No legacy nested fields:
+        assert "composites" not in fam
+        assert "standalone_benchmarks" not in fam
 
 
-def test_metric_count_matches_distinct_benchmark_metric_pairs(tmp_path, monkeypatch):
+def test_hierarchy_legacy_field_names_absent(tmp_path, monkeypatch):
+    """The legacy benchmark-stem-keyed `families[].composites[]` /
+    `families[].standalone_benchmarks[]` shape is gone (AC-7)."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    hi = json.loads((out / "hierarchy.json").read_text())
+    body = json.dumps(hi)
+    assert "standalone_benchmarks" not in body
+    assert "benchmark_family_key" not in body
+
+
+def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
+    """A promoted family member should surface as a benchmark sibling,
+    not as a slice under the bare-stem benchmark.
+    """
+    from eval_card_backend.canonicalise import sidecars
+
+    con = duckdb.connect()
+    con.execute(
+        """
+        CREATE TABLE composites AS
+        SELECT
+            TIMESTAMP '2026-04-30 00:00:00' AS snapshot_id,
+            'wasp' AS composite_slug,
+            'WASP' AS composite_display_name,
+            ['gpqa-diamond']::VARCHAR[] AS source_configs,
+            2::BIGINT AS evals_count
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE families AS
+        SELECT
+            TIMESTAMP '2026-04-30 00:00:00' AS snapshot_id,
+            'gpqa' AS family_id,
+            'GPQA family' AS family_display_name,
+            ['gpqa', 'gpqa-diamond']::VARCHAR[] AS member_benchmark_keys
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE benchmarks AS
+        SELECT
+            TIMESTAMP '2026-04-30 00:00:00' AS snapshot_id,
+            'wasp' AS composite_slug,
+            'WASP' AS composite_display_name,
+            'gpqa' AS benchmark_id,
+            'GPQA' AS display_name,
+            'GPQA' AS benchmark_display_name,
+            NULL::VARCHAR AS description,
+            NULL::VARCHAR AS dataset_repo,
+            NULL::VARCHAR AS parent_benchmark_id,
+            'gpqa' AS family_id,
+            'GPQA family' AS family_display_name,
+            FALSE AS is_slice,
+            ['reasoning']::VARCHAR[] AS registry_tags,
+            NULL::JSON AS registry_metadata,
+            'reviewed' AS review_status,
+            NULL::VARCHAR AS card_name,
+            NULL::VARCHAR AS overview,
+            NULL::VARCHAR AS data_type,
+            ['reasoning']::VARCHAR[] AS domains,
+            []::VARCHAR[] AS languages,
+            []::VARCHAR[] AS similar_benchmarks,
+            []::VARCHAR[] AS resources,
+            NULL::VARCHAR AS goal,
+            []::VARCHAR[] AS audience,
+            ['qa']::VARCHAR[] AS tasks,
+            NULL::VARCHAR AS limitations,
+            []::VARCHAR[] AS out_of_scope_uses,
+            NULL::VARCHAR AS data_source,
+            NULL::VARCHAR AS data_size,
+            NULL::VARCHAR AS data_format,
+            NULL::VARCHAR AS data_annotation,
+            []::VARCHAR[] AS methods,
+            []::VARCHAR[] AS card_metrics,
+            NULL::VARCHAR AS calculation,
+            NULL::VARCHAR AS interpretation,
+            NULL::VARCHAR AS baseline_results,
+            NULL::VARCHAR AS validation,
+            NULL::VARCHAR AS privacy_and_anonymity,
+            NULL::VARCHAR AS data_licensing,
+            NULL::VARCHAR AS consent_procedures,
+            NULL::VARCHAR AS compliance_with_regulations,
+            NULL AS possible_risks,
+            NULL::JSON AS flagged_fields,
+            FALSE AS card_present,
+            NULL::VARCHAR AS card_generated_by,
+            0 AS card_flagged_count,
+            0 AS card_missing_count
+        UNION ALL
+        SELECT
+            TIMESTAMP '2026-04-30 00:00:00',
+            'wasp',
+            'WASP',
+            'gpqa-diamond',
+            'GPQA Diamond',
+            'GPQA Diamond',
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            'gpqa',
+            'GPQA family',
+            FALSE,
+            ['reasoning']::VARCHAR[],
+            NULL::JSON,
+            'reviewed',
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            ['reasoning']::VARCHAR[],
+            []::VARCHAR[],
+            []::VARCHAR[],
+            []::VARCHAR[],
+            NULL::VARCHAR,
+            []::VARCHAR[],
+            ['qa']::VARCHAR[],
+            NULL::VARCHAR,
+            []::VARCHAR[],
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            []::VARCHAR[],
+            []::VARCHAR[],
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL::VARCHAR,
+            NULL,
+            NULL::JSON,
+            FALSE,
+            NULL::VARCHAR,
+            0,
+            0
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE evals_view AS
+        SELECT
+            'wasp%2Fgpqa' AS evaluation_id,
+            'wasp' AS composite_slug,
+            'gpqa' AS benchmark_id,
+            'GPQA' AS evaluation_name,
+            'Reasoning' AS category,
+            1::BIGINT AS models_count,
+            NULL AS reproducibility_summary,
+            NULL AS provenance_summary,
+            NULL AS comparability_summary
+        UNION ALL
+        SELECT
+            'wasp%2Fgpqa-diamond',
+            'wasp',
+            'gpqa-diamond',
+            'GPQA Diamond',
+            'Reasoning',
+            1::BIGINT,
+            NULL,
+            NULL,
+            NULL
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE eval_results_view AS
+        SELECT
+            'wasp' AS composite_slug,
+            'gpqa' AS benchmark_id,
+            'accuracy' AS metric_id,
+            'Accuracy' AS metric_display_name,
+            struct_pack(source_organization_name := 'WASP') AS source_metadata
+        UNION ALL
+        SELECT
+            'wasp',
+            'gpqa-diamond',
+            'accuracy',
+            'Accuracy',
+            struct_pack(source_organization_name := 'WASP')
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE fact_results (
+            composite_slug VARCHAR,
+            benchmark_id VARCHAR,
+            slice_key VARCHAR,
+            slice_name VARCHAR,
+            metric_id VARCHAR,
+            model_key VARCHAR,
+            org_raw VARCHAR
+        )
+        """
+    )
+    con.executemany(
+        "INSERT INTO fact_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("wasp", "gpqa", None, None, "accuracy", "m1", "WASP"),
+            ("wasp", "gpqa-diamond", None, None, "accuracy", "m1", "WASP"),
+        ],
+    )
+    con.execute(
+        "CREATE TABLE canonical_metrics AS "
+        "SELECT 'accuracy' AS id, 'Accuracy' AS display_name"
+    )
+
+    sidecars.write_hierarchy(
+        con,
+        tmp_path,
+        {"snapshot_id": "2026-04-30T00:00:00Z"},
+    )
+    hierarchy = json.loads((tmp_path / "hierarchy.json").read_text())
+
+    wasp = next(c for c in hierarchy["composites"] if c["key"] == "wasp")
+    assert [b["key"] for b in wasp["benchmarks"]] == ["gpqa", "gpqa-diamond"]
+    assert all(
+        s["key"] != "gpqa-diamond"
+        for b in wasp["benchmarks"]
+        for s in b["slices"]
+    )
+    gpqa_family = next(f for f in hierarchy["families"] if f["key"] == "gpqa")
+    assert gpqa_family["member_benchmark_keys"] == ["gpqa", "gpqa-diamond"]
+
+
+def test_metric_count_matches_distinct_composite_benchmark_metric_triples(
+    tmp_path, monkeypatch,
+):
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     con = _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
     expected = con.execute(
-        "SELECT COUNT(DISTINCT (benchmark_id, metric_id)) "
+        "SELECT COUNT(DISTINCT (composite_slug, benchmark_id, metric_id)) "
         "FROM fact_results "
-        "WHERE benchmark_id IS NOT NULL AND metric_id IS NOT NULL"
+        "WHERE composite_slug IS NOT NULL "
+        "  AND benchmark_id IS NOT NULL AND metric_id IS NOT NULL"
     ).fetchone()[0]
     assert hi["stats"]["metric_count"] == expected
+
+
+def test_manifest_has_composite_count(tmp_path, monkeypatch):
+    """AC-9 — manifest.json carries composite_count alongside the
+    existing model/eval/metric counts."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert "composite_count" in manifest
+    assert manifest["composite_count"] >= 1
+
+
+def test_comparison_index_evaluation_id_format(tmp_path, monkeypatch):
+    """AC-10 — evaluation_id is `<composite_slug>/<benchmark_id>` URL-encoded."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    ci = json.loads((out / "comparison-index.json").read_text())
+    for eval_id in ci["evals"]:
+        # Decoded form contains a `/` separator.
+        from urllib.parse import unquote
+        decoded = unquote(eval_id)
+        assert "/" in decoded, f"evaluation_id missing /: {eval_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +548,8 @@ def test_comparison_index_eval_keyset_covers_eval_results_view(tmp_path, monkeyp
 
 def test_comparison_index_eval_entry_required_fields(tmp_path, monkeypatch):
     """ComparisonEvalEntry contract — fields the frontend reads for
-    benchmark_family_key, display_name, category, etc."""
+    composite_slug / family_id / display_name / category, etc.
+    """
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
@@ -289,12 +557,15 @@ def test_comparison_index_eval_entry_required_fields(tmp_path, monkeypatch):
     assert ci["evals"], "comparison-index has no evals; nothing to validate"
     sample = next(iter(ci["evals"].values()))
     assert {
-        "eval_summary_id", "benchmark_family_key", "benchmark_family_name",
-        "benchmark_parent_key", "benchmark_parent_name",
-        "benchmark_leaf_key", "benchmark_leaf_name",
+        "eval_summary_id",
+        "composite_slug", "composite_display_name",
+        "family_id", "family_display_name", "is_slice",
         "display_name", "category", "is_summary_score",
         "summary_score_for", "summary_eval_ids", "metrics",
     } <= set(sample.keys())
+    # Legacy fields removed in the composite/family/slice cutover:
+    assert "benchmark_family_key" not in sample
+    assert "benchmark_leaf_key" not in sample
 
 
 def test_comparison_index_scores_ranked_best_first(tmp_path, monkeypatch):
