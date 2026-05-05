@@ -1,6 +1,6 @@
 """Stage J — JSON sidecars for the view layer.
 
-Four small documents the frontend reads alongside the view parquets:
+Five small documents the frontend reads alongside the view parquets:
 
 - `manifest.json` — corpus-level scalars (model_count, eval_count, …).
 - `headline.json` — corpus signal aggregates with stratified by-category
@@ -11,6 +11,12 @@ Four small documents the frontend reads alongside the view parquets:
 - `comparison-index.json` — per-(eval, metric) leaderboards plus an inverse
   model→peer index. Backs the model-detail grid view; without it the grid
   renders empty regardless of how many cells the model has.
+- `benchmark_index.json` — per-benchmark cross-composite appearance index.
+  For each canonical `benchmark_id`, lists every composite reporting it
+  with the primary-metric aggregate stats (avg/top score, models_count).
+  Lets a benchmark-detail page render "HELM/MMLU avg=X across N models,
+  Open LLM v2/MMLU avg=Y across M models" without scanning the full
+  hierarchy tree.
 
 These are emitted by Python serialisation rather than DuckDB COPY because
 they're scalar/JSON-shaped, not columnar, and the frontend reads them as
@@ -41,18 +47,23 @@ def write_manifest(con, out_dir: Path, snapshot_meta: dict) -> Path:
     counts = con.execute(
         """
         SELECT
-            -- Use model_key so unresolved models (registry NULL) still
-            -- count toward the corpus headline numbers.
-            COUNT(DISTINCT model_key) FILTER (WHERE model_key IS NOT NULL)
+            -- Root-grain model count (variants of one identity collapse
+            -- to one model). `model_aggregation_key` falls back to the
+            -- raw source name when canonical resolution failed, so
+            -- unresolved models still count toward the headline.
+            COUNT(DISTINCT model_aggregation_key)
+                FILTER (WHERE model_aggregation_key IS NOT NULL)
                 AS model_count,
-            COUNT(DISTINCT (composite_slug, benchmark_id))
-                FILTER (WHERE composite_slug IS NOT NULL AND benchmark_id IS NOT NULL)
+            COUNT(DISTINCT (composite_slug, benchmark_key))
+                FILTER (WHERE composite_slug IS NOT NULL
+                        AND   benchmark_key  IS NOT NULL)
                 AS eval_count,
-            COUNT(DISTINCT (model_key, composite_slug, benchmark_id, metric_id))
-                FILTER (WHERE model_key      IS NOT NULL
-                        AND   composite_slug IS NOT NULL
-                        AND   benchmark_id   IS NOT NULL
-                        AND   metric_id      IS NOT NULL)
+            COUNT(DISTINCT (model_aggregation_key, composite_slug,
+                            benchmark_key, metric_key))
+                FILTER (WHERE model_aggregation_key IS NOT NULL
+                        AND   composite_slug         IS NOT NULL
+                        AND   benchmark_key          IS NOT NULL
+                        AND   metric_key             IS NOT NULL)
                 AS metric_eval_count
         FROM fact_results
         """
@@ -82,15 +93,87 @@ def write_manifest(con, out_dir: Path, snapshot_meta: dict) -> Path:
         # is `{repo_id, sha, last_modified}`; values are None on lookup
         # failure (best-effort, never fatal — see _hf_dataset_snapshot).
         "upstream_pins":         snapshot_meta.get("upstream_pins") or {},
+        # raw_verified coverage — drives the 1st/3rd-party classification
+        # for llm-stats rows (see stages.py:878-883). Tracking coverage
+        # makes it visible when upstream EEE starts populating the field
+        # consistently. Per notes/hierarchy-alignment.md §3 / §7 Step 3.
+        "raw_verified_coverage": _raw_verified_coverage(con),
         "summary_artifacts": {
             "corpus_aggregates": "headline.json",
             "eval_hierarchy":    "hierarchy.json",
             "comparison_index":  "comparison-index.json",
+            "benchmark_index":   "benchmark_index.json",
         },
     }
     path = out_dir / "manifest.json"
     path.write_text(json.dumps(payload, indent=2))
     return path
+
+
+def _raw_verified_coverage(con) -> dict:
+    """Tally `metric_config.additional_details.raw_verified` presence
+    across the corpus, broken out by whether the row's source is the
+    llm-stats aggregator (where the field actually drives the
+    first/third-party label per the reference's party_label rule).
+
+    Returns a dict the manifest emits verbatim:
+      {
+        total_rows: int,
+        llm_stats: {total: int, raw_verified_true: int,
+                    raw_verified_false: int, raw_verified_null: int},
+        non_llm_stats: {total: int, raw_verified_true: int,
+                        raw_verified_false: int, raw_verified_null: int},
+      }
+
+    `raw_verified` is `additional_details.raw_verified` — a string
+    'true'/'false' in EEE today, sometimes missing. Read defensively;
+    treat anything not in {'true', 'false'} as missing.
+    """
+    row = con.execute(
+        """
+        WITH rv AS (
+            SELECT
+                fr.source_config = 'llm-stats' AS is_llm_stats,
+                -- metric_additional_details is a JSON-encoded VARCHAR;
+                -- json_extract_string returns NULL when the key is
+                -- absent or the value isn't a string. Lowercase to
+                -- normalise 'True'/'TRUE'/'true' variants.
+                LOWER(COALESCE(
+                    json_extract_string(fr.metric_additional_details, '$.raw_verified'),
+                    ''
+                )) AS rv
+            FROM fact_results fr
+        )
+        SELECT
+            COUNT(*)                                                AS total,
+            COUNT(*) FILTER (WHERE is_llm_stats)                     AS ls_total,
+            COUNT(*) FILTER (WHERE is_llm_stats AND rv = 'true')     AS ls_true,
+            COUNT(*) FILTER (WHERE is_llm_stats AND rv = 'false')    AS ls_false,
+            COUNT(*) FILTER (WHERE is_llm_stats
+                             AND rv NOT IN ('true', 'false'))        AS ls_null,
+            COUNT(*) FILTER (WHERE NOT is_llm_stats)                 AS nls_total,
+            COUNT(*) FILTER (WHERE NOT is_llm_stats AND rv = 'true') AS nls_true,
+            COUNT(*) FILTER (WHERE NOT is_llm_stats AND rv = 'false') AS nls_false,
+            COUNT(*) FILTER (WHERE NOT is_llm_stats
+                             AND rv NOT IN ('true', 'false'))        AS nls_null
+        FROM rv
+        """
+    ).fetchone()
+    return {
+        "total_rows":    int(row[0] or 0),
+        "llm_stats": {
+            "total":              int(row[1] or 0),
+            "raw_verified_true":  int(row[2] or 0),
+            "raw_verified_false": int(row[3] or 0),
+            "raw_verified_null":  int(row[4] or 0),
+        },
+        "non_llm_stats": {
+            "total":              int(row[5] or 0),
+            "raw_verified_true":  int(row[6] or 0),
+            "raw_verified_false": int(row[7] or 0),
+            "raw_verified_null":  int(row[8] or 0),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -127,11 +210,14 @@ def _reproducibility_block(con, category: str | None) -> dict:
         cat_join = ""
         cat_where = ""
     else:
+        # erv columns are root-grain / canonical-or-raw keyed; fr's
+        # `*_aggregation_key` / `*_key` mirror that grain so the JOIN
+        # collapses variants to their root before category filtering.
         cat_join = (
             "JOIN eval_results_view erv "
-            "  ON erv.model_key    = fr.model_key "
-            " AND erv.benchmark_id = fr.benchmark_id "
-            " AND erv.metric_id    = fr.metric_id"
+            "  ON erv.model_key    = fr.model_aggregation_key "
+            " AND erv.benchmark_id = fr.benchmark_key "
+            " AND erv.metric_id    = fr.metric_key"
         )
         cat_where = _category_filter_clause(category, alias="erv")
 
@@ -146,15 +232,15 @@ def _reproducibility_block(con, category: str | None) -> dict:
     triple_rollup_sql = f"""
         WITH triple_rollups AS (
             SELECT
-                fr.model_key, fr.benchmark_id, fr.metric_id,
+                fr.model_aggregation_key, fr.benchmark_key, fr.metric_key,
                 BOOL_OR(fr.has_reproducibility_gap) AS triple_has_gap,
                 BOOL_OR(fr.is_agentic)              AS triple_agentic,
                 {field_flags_sql}
             FROM fact_results fr
             {cat_join}
-            WHERE fr.model_key    IS NOT NULL
-              AND fr.benchmark_id IS NOT NULL
-              AND fr.metric_id    IS NOT NULL
+            WHERE fr.model_aggregation_key IS NOT NULL
+              AND fr.benchmark_key         IS NOT NULL
+              AND fr.metric_key            IS NOT NULL
               {cat_where}
             GROUP BY 1, 2, 3
         )
@@ -445,32 +531,343 @@ def write_headline(con, out_dir: Path, snapshot_meta: dict) -> Path:
 
 
 def write_hierarchy(con, out_dir: Path, snapshot_meta: dict) -> Path:
-    """Composite/family/slice tree.
+    """Family-rooted hierarchy tree (v3).
 
-    Two top-level arrays:
-      - `composites[]`: one entry per composite_slug, each with its
-        list of benchmarks (and per-benchmark slices).
-      - `families[]`: lookup index — one entry per family_id with the
-        list of member benchmark keys.
+    Per `notes/hierarchy-alignment.md` §5.1, the top-level shape is:
 
-    Composites are the primary tree. A benchmark reported in N
-    composites appears N times across `composites[].benchmarks[]`,
-    each occurrence with its own slices for that composite. The
-    families[] index is what the frontend uses on a benchmark-detail
-    page to render "related benchmarks in family X" links.
+      {
+        schema_version: "v3.hierarchy.1",
+        generated_at, stats,
+        families: [{key, display_name, category, tags, evals_count,
+                    eval_summary_ids, provenance_summary,
+                    standalone_benchmarks | benchmarks | composites}],
+      }
+
+    Each family chooses ONE of three layouts based on its content:
+      - `standalone_benchmarks[]`: single-benchmark family.
+      - `benchmarks[]` (flat): multiple benchmarks, no composite layer.
+      - `composites[].benchmarks[]`: multiple distinct named groupings
+        within the family (HELM has 7 composites; MMLU-Pro has 1).
+
+    Bucketing rules:
+      - Composite with `family_id` set in canonical_composites lands
+        under that family.
+      - Composite without `family_id` becomes its own singleton family
+        (family.id == composite.id).
     """
-    composites = _hierarchy_composites(con)
-    families = _hierarchy_families_index(con)
-    stats = _hierarchy_stats(con, composites, families)
+    composites = _hierarchy_composites(con)  # rich per-composite records
+    family_records = _hierarchy_v3_families(con, composites)
+    benchmark_index = _hierarchy_v3_benchmark_index(con, family_records)
+    stats = _hierarchy_v3_stats(con, family_records)
+
     payload = {
-        "generated_at": snapshot_meta["snapshot_id"],
-        "stats":        stats,
-        "composites":   composites,
-        "families":     families,
+        "schema_version":  "v3.hierarchy.1",
+        "generated_at":    snapshot_meta["snapshot_id"],
+        "stats":           stats,
+        "families":        family_records,
+        "benchmark_index": benchmark_index,
     }
     path = out_dir / "hierarchy.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default))
     return path
+
+
+def _hierarchy_v3_benchmark_index(con, families: list[dict]) -> list[dict]:
+    """Cross-suite lookup. One entry per canonical benchmark that
+    surfaces under 2+ distinct families (e.g. AIME under llm-stats AND
+    artificial-analysis). Per spec §5.1 / ref-build_hierarchy.py:1009-1089.
+
+    Each entry:
+      {
+        key:          canonical benchmark id,
+        display_name: benchmark display,
+        appearances: [{family_key, benchmark_key, eval_summary_ids,
+                       models_count, is_canonical_home}],
+      }
+
+    `is_canonical_home` flags the appearance whose family is the
+    benchmark's "natural" home (family_key == benchmark_key, i.e. the
+    benchmark IS the family root somewhere). Useful for the frontend
+    to render the headline link.
+
+    The reference also computes per-(model, metric) cross-suite
+    aggregates; that's deferred — it's data analysis, not structure.
+    """
+    from collections import defaultdict
+
+    # Walk every benchmark across every family layout. Each appearance
+    # is one (family, benchmark) pair carrying its summary_eval_ids.
+    appearances_by_bench: dict[str, list[dict]] = defaultdict(list)
+    for fam in families:
+        bench_streams = [
+            *(fam.get("standalone_benchmarks") or []),
+            *(fam.get("benchmarks") or []),
+            *(b for c in (fam.get("composites") or [])
+                for b in (c.get("benchmarks") or [])),
+        ]
+        for b in bench_streams:
+            bench_key = b["key"]
+            appearances_by_bench[bench_key].append({
+                "family_key":        fam["key"],
+                "benchmark_key":     bench_key,
+                "eval_summary_ids":  list(b.get("summary_eval_ids") or []),
+                "is_canonical_home": (fam["key"] == bench_key),
+            })
+
+    # Look up display names from the benchmarks dim — one canonical id
+    # may have inconsistent display_name across composites; pick the
+    # one tied to the canonical_home appearance when possible.
+    display_lookup: dict[str, str] = {}
+    for fam in families:
+        for stream_name in ("standalone_benchmarks", "benchmarks"):
+            for b in fam.get(stream_name) or []:
+                display_lookup.setdefault(b["key"], b.get("display_name") or b["key"])
+        for c in fam.get("composites") or []:
+            for b in c.get("benchmarks") or []:
+                display_lookup.setdefault(b["key"], b.get("display_name") or b["key"])
+
+    out: list[dict] = []
+    for bench_key in sorted(appearances_by_bench):
+        appearances = appearances_by_bench[bench_key]
+        distinct_families = {a["family_key"] for a in appearances}
+        # Cross-suite means 2+ DISTINCT families. Same-family appearances
+        # (rare; would mean a benchmark appears under multiple composite
+        # layouts within one family) don't count.
+        if len(distinct_families) < 2:
+            continue
+        out.append({
+            "key":          bench_key,
+            "display_name": display_lookup.get(bench_key, bench_key),
+            "appearances":  appearances,
+        })
+    return out
+
+
+def _hierarchy_v3_families(con, composites: list[dict]) -> list[dict]:
+    """Bucket composites by family_id (from canonical_composites + a
+    dim-level join), then for each family choose a layout per spec §3.
+
+    Reads `canonical_families` and `canonical_composites` from the
+    DuckDB connection (Stage A loaded them via taxonomy.py). Composites
+    without a curated family_id become singleton families.
+    """
+    import json as _json
+    from collections import defaultdict
+
+    # --- Pull family / composite curation from registry tables ---
+    fam_rows = con.execute(
+        "SELECT id, display_name, category, tags, "
+        "       benchmark_ids, composite_keys "
+        "  FROM canonical_families"
+    ).fetchall() if _table_exists(con, "canonical_families") else []
+    families_curated: dict[str, dict] = {}
+    for r in fam_rows:
+        fid, display, cat, tags, bench_ids, comp_keys = r
+        families_curated[fid] = {
+            "display_name":   display or fid,
+            "category":       (cat or "other"),
+            "tags":           _decode_json_list(tags),
+            "benchmark_ids":  _decode_json_list(bench_ids),
+            "composite_keys": _decode_json_list(comp_keys),
+        }
+
+    comp_rows = con.execute(
+        "SELECT id, family_id FROM canonical_composites"
+    ).fetchall() if _table_exists(con, "canonical_composites") else []
+    composite_to_family: dict[str, str] = {}
+    for cid, fid in comp_rows:
+        if fid:
+            composite_to_family[cid] = fid
+
+    # --- Bucket composites by family ---
+    by_family: dict[str, list[dict]] = defaultdict(list)
+    for comp in composites:
+        family_id = composite_to_family.get(comp["key"], comp["key"])
+        by_family[family_id].append(comp)
+
+    # Add curated families that have no composites (rare — covers the
+    # case of a families.yaml entry whose member benchmarks landed
+    # entirely inside composites that *do* have family_id but the
+    # curated entry is the parent grouping). Empty buckets are skipped
+    # below.
+    for fid in families_curated:
+        by_family.setdefault(fid, [])
+
+    # --- Build per-family records ---
+    out: list[dict] = []
+    for fid in sorted(by_family):
+        family_composites = by_family[fid]
+        if not family_composites:
+            continue
+
+        curated = families_curated.get(fid)
+        # Display name preference: curated > composite display when
+        # singleton > family id. Curated wins so HELM family says
+        # "HELM" not "HELM Classic" (the first composite alphabetically).
+        if curated:
+            display_name = curated["display_name"]
+            category = curated["category"]
+            family_tags = curated["tags"]
+        else:
+            display_name = family_composites[0]["display_name"]
+            category = family_composites[0].get("category") or "other"
+            family_tags = []
+
+        # Roll up benchmarks across all of this family's composites.
+        # Each composite record has benchmarks[] already (rich, with
+        # slices/metrics/etc).
+        all_benchmarks: list[dict] = []
+        all_eval_summary_ids: set[str] = set()
+        for comp in family_composites:
+            for bench in comp.get("benchmarks", []):
+                all_benchmarks.append(bench)
+                for eid in bench.get("summary_eval_ids", []) or []:
+                    all_eval_summary_ids.add(eid)
+
+        # --- Layout selection ---
+        # 1. Multi-composite family → composites[] layout (HELM).
+        # 2. Single composite + single benchmark → standalone_benchmarks.
+        # 3. Single composite, multiple benchmarks → flat benchmarks[].
+        # 4. No benchmarks anywhere (curated family with empty composites)
+        #    → skip (continue above already filtered empty buckets).
+        family_record: dict = {
+            "key":              fid,
+            "display_name":     display_name,
+            "category":         category,
+            "tags":             _merge_family_tags(family_tags, all_benchmarks),
+            "evals_count":      sum(int(c.get("evals_count") or 0)
+                                    for c in family_composites),
+            "eval_summary_ids": sorted(all_eval_summary_ids),
+        }
+
+        # Aggregate signal summaries across the family's benchmarks.
+        # Reuses the per-composite aggregators which take a list of
+        # benchmark records.
+        family_record["reproducibility_summary"] = _aggregate_reproducibility(all_benchmarks)
+        family_record["provenance_summary"]      = _aggregate_provenance(all_benchmarks)
+        family_record["comparability_summary"]   = _aggregate_comparability(all_benchmarks)
+
+        # Mark the headline benchmark within this family. Sets
+        # is_primary on each benchmark row across whatever layout the
+        # family ends up using.
+        _mark_family_primary_benchmark(fid, all_benchmarks)
+
+        if len(family_composites) >= 2:
+            # Multi-composite layout (HELM): the family doesn't carry
+            # a flat benchmarks[]; each composite has its own. Mark the
+            # primary composite (first one alphabetically until a
+            # FAMILY_PRIMARY_OVERRIDE-equivalent for composites surfaces).
+            primary_comp = sorted(family_composites, key=lambda c: c["key"])[0]
+            for comp in family_composites:
+                comp["is_primary"] = (comp["key"] == primary_comp["key"])
+            family_record["composites"] = family_composites
+        elif len(all_benchmarks) == 1:
+            family_record["standalone_benchmarks"] = all_benchmarks
+        elif len(all_benchmarks) >= 2:
+            family_record["benchmarks"] = all_benchmarks
+        else:
+            # Curated family with no benchmarks materialised — skip.
+            # (Defensive; should be filtered by the empty-bucket check.)
+            continue
+
+        out.append(family_record)
+
+    return out
+
+
+def _hierarchy_v3_stats(con, families: list[dict]) -> dict:
+    """Snapshot-level rollup counts for v3 hierarchy. `metric_rows_scanned`
+    is the raw fact-row count (each row = one reported result from one
+    source) — distinct-triple counting would dedup away cross-source
+    reports and read as ~3x lower than the user expects.
+    """
+    row = con.execute(
+        """
+        SELECT
+            (SELECT COUNT(DISTINCT (benchmark_key, slice_key))
+                 FROM fact_results
+                 WHERE benchmark_key IS NOT NULL
+                   AND slice_key     IS NOT NULL)                     AS slice_count,
+            (SELECT COUNT(DISTINCT (composite_slug, benchmark_key, metric_key))
+                 FROM fact_results
+                 WHERE composite_slug IS NOT NULL
+                   AND benchmark_key  IS NOT NULL
+                   AND metric_key     IS NOT NULL)                    AS metric_count,
+            (SELECT COUNT(*) FROM fact_results)                       AS metric_rows_scanned,
+            (SELECT COUNT(DISTINCT benchmark_id)
+                 FROM benchmarks WHERE benchmark_id IS NOT NULL)      AS benchmark_count
+        """
+    ).fetchone()
+    composite_count = sum(
+        len(f.get("composites", []))
+        # `+1` accounts for families with a single nested composite that
+        # got hoisted into the flat / standalone layouts; the composite
+        # still exists semantically.
+        + (1 if f.get("benchmarks") or f.get("standalone_benchmarks") else 0)
+        for f in families
+    )
+    return {
+        "family_count":         len(families),
+        "composite_count":      composite_count,
+        "benchmark_count":      int(row[3] or 0),
+        "slice_count":          int(row[0] or 0),
+        "metric_count":         int(row[1] or 0),
+        "metric_rows_scanned":  int(row[2] or 0),
+    }
+
+
+def _table_exists(con, name: str) -> bool:
+    """True when a table or view exists on the connection. The
+    canonical_families / canonical_composites tables are loaded from
+    the registry parquets via taxonomy.py; if a deployment is on an
+    old registry snapshot without them, write_hierarchy degrades to
+    a no-curation flat output."""
+    rows = con.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+        [name],
+    ).fetchall()
+    return bool(rows)
+
+
+def _decode_json_list(value) -> list:
+    import json as _json
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s in ("[]", "null"):
+            return []
+        try:
+            d = _json.loads(s)
+            return list(d) if isinstance(d, list) else []
+        except (ValueError, TypeError):
+            return []
+    return []
+
+
+def _merge_family_tags(family_tags: list, benchmarks: list[dict]) -> dict:
+    """Combine curated family tags (a flat string list) with per-
+    benchmark tag dicts ({domains, languages, tasks}). Family-level
+    tags get folded into `domains` since the curated family.tags is
+    closest to that semantically."""
+    domains = set(d for d in family_tags if isinstance(d, str))
+    languages: set[str] = set()
+    tasks: set[str] = set()
+    for b in benchmarks:
+        bench_tags = b.get("tags") or {}
+        for d in bench_tags.get("domains") or []:
+            domains.add(d)
+        for l in bench_tags.get("languages") or []:
+            languages.add(l)
+        for t in bench_tags.get("tasks") or []:
+            tasks.add(t)
+    return {
+        "domains":   sorted(domains),
+        "languages": sorted(languages),
+        "tasks":     sorted(tasks),
+    }
 
 
 def _hierarchy_stats(
@@ -488,15 +885,15 @@ def _hierarchy_stats(
     row = con.execute(
         """
         SELECT
-            (SELECT COUNT(DISTINCT (benchmark_id, slice_key))
+            (SELECT COUNT(DISTINCT (benchmark_key, slice_key))
                  FROM fact_results
-                 WHERE benchmark_id IS NOT NULL
-                   AND slice_key    IS NOT NULL)                      AS slice_count,
-            (SELECT COUNT(DISTINCT (composite_slug, benchmark_id, metric_id))
+                 WHERE benchmark_key IS NOT NULL
+                   AND slice_key     IS NOT NULL)                     AS slice_count,
+            (SELECT COUNT(DISTINCT (composite_slug, benchmark_key, metric_key))
                  FROM fact_results
                  WHERE composite_slug IS NOT NULL
-                   AND benchmark_id   IS NOT NULL
-                   AND metric_id      IS NOT NULL)                    AS metric_count,
+                   AND benchmark_key  IS NOT NULL
+                   AND metric_key     IS NOT NULL)                    AS metric_count,
             (SELECT COUNT(*) FROM fact_results)                       AS metric_rows_scanned,
             (SELECT COUNT(DISTINCT benchmark_id)
                  FROM benchmarks WHERE benchmark_id IS NOT NULL)      AS benchmark_count
@@ -526,6 +923,13 @@ def _hierarchy_composites(con) -> list[dict]:
         ).fetchall()
     )
 
+    # LEFT JOIN preserves the bare-parent shells (e.g. arc-agi) so the
+    # 6 ARC-AGI level slices have a root to nest under in the hierarchy
+    # tree. Shell rows have NULL evaluation_id (they're absent from
+    # evals_view, which dropped them per #22) — that null signals
+    # "structural anchor only, not navigable" to the frontend. Step 3
+    # reshapes this sidecar to put these shells in a family/composite
+    # layer where they belong.
     rows = con.execute(
         """
         SELECT
@@ -584,6 +988,28 @@ def _hierarchy_composites(con) -> list[dict]:
                     **m, "_is_bare_stem": True,
                 })
 
+        # Drop fact-less shell roots and promote their slices to roots.
+        # The dim carries shells (evaluation_id=null) so the LEFT JOIN
+        # above keeps the structural anchor; but a shell isn't a
+        # navigable eval (the user gets "Evaluation not found") and the
+        # slices have their own facts, so we surface them at root level
+        # instead. Step 3's reshape will move shells into a proper
+        # family/composite layer where they don't pose as benchmarks.
+        navigable_roots = []
+        for root in roots:
+            if root.get("evaluation_id") is not None:
+                navigable_roots.append(root)
+                continue
+            promoted_slices = slices_by_root.pop(root["benchmark_id"], [])
+            for s in promoted_slices:
+                if s.get("_is_bare_stem"):
+                    # Self-parented bare stem of a shell → drop entirely;
+                    # it's the shell viewed from a different angle.
+                    continue
+                navigable_roots.append({**s, "is_slice": False,
+                                        "parent_benchmark_id": None})
+        roots = navigable_roots
+
         bench_records = [
             _hierarchy_composite_benchmark(con, slug, root, slices_by_root.get(root["benchmark_id"], []))
             for root in roots
@@ -631,6 +1057,202 @@ def _composite_category(members: list[dict]) -> str:
     return candidates[0]
 
 
+# ---------------------------------------------------------------------------
+# Display polish: prettify_display + ACRONYMS handling
+# ---------------------------------------------------------------------------
+
+
+# Loaded lazily from `<registry_root>/display_overrides.yaml`. Curators
+# add slugs that should render uppercase (e.g. "mmlu" → "MMLU") rather
+# than the default title-case ("Mmlu"). Falls back to a hard-coded set
+# when the file is unavailable so the producer doesn't degrade silently.
+_FALLBACK_ACRONYMS: frozenset[str] = frozenset({
+    "gaia", "gpqa", "mmlu", "mmmu", "bfcl", "helm", "ifeval", "bbh",
+    "mmlu-pro", "musr", "math", "gsm8k", "arc-agi", "swe-bench",
+    "ace", "hle", "aime", "hal", "usaco",
+})
+
+_acronyms_cache: frozenset[str] | None = None
+
+
+def _load_acronyms() -> frozenset[str]:
+    """Read curated acronyms from the registry cache. Cached at module
+    level — the seed YAML is small and immutable per snapshot."""
+    global _acronyms_cache
+    if _acronyms_cache is not None:
+        return _acronyms_cache
+    candidates = [
+        Path(".cache/entity_registry/display_overrides.yaml"),
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(path.read_text()) or {}
+        except (ImportError, OSError, ValueError):
+            continue
+        items = data.get("acronyms") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            _acronyms_cache = frozenset(str(s).lower() for s in items if s)
+            return _acronyms_cache
+    _acronyms_cache = _FALLBACK_ACRONYMS
+    return _acronyms_cache
+
+
+def _title_segment(seg: str, acronyms: frozenset[str]) -> str:
+    """Title-case one segment of a slug, preserving curated acronyms.
+    Numeric / version-like tokens (1m, v1, 2024) stay as-is. Mirrors
+    ref-build_hierarchy.py:_title_segment."""
+    if not seg:
+        return seg
+    if seg.lower() in acronyms:
+        return seg.upper()
+    if seg.replace(".", "").isdigit() or re.fullmatch(r"v\d+(\.\d+)*", seg):
+        return seg
+    if seg[0].isalpha() and seg[0].islower():
+        return seg[:1].upper() + seg[1:]
+    return seg
+
+
+def prettify_display(name: str | None) -> str:
+    """Cleanup an arbitrary slug or eval label into a tidy human title.
+
+    - None / empty → "" (caller can fall back to id).
+    - Underscores become spaces.
+    - Mixed-case input (already curated, e.g. "MMLU-Pro" or
+      "Humanity's Last Exam") is returned unchanged.
+    - All-lowercase input is title-cased per hyphen-segment with
+      curated acronyms preserved.
+
+    Mirrors ref-build_hierarchy.py:prettify_display.
+    """
+    if not name:
+        return ""
+    cleaned = name.replace("_", " ").strip()
+    if any(c.isupper() for c in cleaned):
+        return cleaned
+    acronyms = _load_acronyms()
+    words = cleaned.split()
+    out: list[str] = []
+    for w in words:
+        if "-" in w:
+            out.append("-".join(_title_segment(s, acronyms) for s in w.split("-")))
+        else:
+            out.append(_title_segment(w, acronyms))
+    return " ".join(out)
+
+
+# Metric-tail detector. When evaluation_name = "{slice} {metric}" without
+# an explicit metric_config.metric_name, the producer's slice_key carries
+# the slice portion — but rendering may still benefit from peeling the
+# trailing metric off display labels. Mirrors
+# ref-build_hierarchy.py:_METRIC_TAIL_RE.
+_METRIC_TAIL_RE = re.compile(
+    r"\s+("
+    r"(?:mean\s+)?(?:score|accuracy|f1|em|loss)|"
+    r"pass@\d+|pass@k|"
+    r"standard\s+error|win\s+rate|"
+    r"avg(?:\s+(?:attempts|latency(?:_ms)?))?|"
+    r"average\s+attempts|"
+    r"mean|rank|elo"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def peel_metric_tail(label: str | None) -> tuple[str, str | None]:
+    """Split a display label into (slice_label, metric_tail) when it
+    looks like "X Pass@1" / "Overall Mean Score". When no tail matches,
+    returns (label, None). The peeled metric_tail is the trailing
+    metric phrase; consumers usually move it from the slice display
+    onto the metric label.
+    """
+    if not label:
+        return ("", None)
+    m = _METRIC_TAIL_RE.search(label)
+    if m and m.start() > 0:
+        return (label[: m.start()].rstrip(), label[m.start():].strip())
+    return (label, None)
+
+
+# Primary-metric preference list, in order. Ports
+# `PRIMARY_METRIC_PREFERENCE` from ref-build_hierarchy.py:275-279.
+# Compared case-insensitively against metric_display_name. Earlier
+# entries win.
+_PRIMARY_METRIC_PREFERENCE: tuple[str, ...] = (
+    "overall", "mean win rate", "mean score", "score", "accuracy",
+    "exact match", "exact_match", "win rate", "elo", "rank",
+    "pass@1", "f1", "mean",
+)
+
+
+# Explicit overrides for which benchmark is the "primary readout" of a
+# family or composite — i.e. the row whose primary metric the frontend
+# surfaces as the family's headline number. Ports
+# `FAMILY_PRIMARY_OVERRIDE` from ref-build_hierarchy.py:285-287.
+# Add entries here when the heuristic (first-with-is_overall, else
+# first by sort) picks the wrong row for a family.
+_FAMILY_PRIMARY_OVERRIDE: dict[str, str] = {
+    "artificial-analysis": "artificial-analysis-intelligence-index",
+}
+
+
+def _mark_family_primary_benchmark(
+    family_key: str, benchmarks: list[dict]
+) -> None:
+    """Mutate `benchmarks` in place: set `is_overall` (this row IS the
+    family root) and `is_primary` (this row is the family's headline
+    reading) per spec §5.1.
+
+    `is_overall`: True iff `benchmark.key == family_key`. A multi-bench
+    family without a head benchmark of the same name (HAL, BFCL family
+    with no `bfcl` benchmark) has no overall row — all False.
+
+    `is_primary` selection:
+      1. _FAMILY_PRIMARY_OVERRIDE explicit map (curator-supplied).
+      2. The benchmark with `is_overall=True` (the family-root row).
+      3. The first benchmark by ascending key (stable tie-break).
+    """
+    if not benchmarks:
+        return
+    for b in benchmarks:
+        b["is_overall"] = (b["key"] == family_key)
+
+    override = _FAMILY_PRIMARY_OVERRIDE.get(family_key)
+    if override:
+        primary_key = override
+    else:
+        overall = next((b for b in benchmarks if b["is_overall"]), None)
+        primary_key = (overall or sorted(benchmarks, key=lambda x: x["key"])[0])["key"]
+    for b in benchmarks:
+        b["is_primary"] = (b["key"] == primary_key)
+
+
+def _pick_primary_metric_key(metrics: list[dict]) -> str | None:
+    """Return the metric_key of the primary metric for a benchmark, or
+    None when the benchmark has no metrics. Mirrors
+    `pick_primary_metric` from ref-build_hierarchy.py:290-300:
+
+      1. First metric whose display name (case-insensitive) matches an
+         entry in `_PRIMARY_METRIC_PREFERENCE`, in preference order.
+      2. Fallback: most-reported metric (highest `models_count`,
+         tie-break alphabetical on metric_key).
+    """
+    if not metrics:
+        return None
+    by_name = {(m.get("display_name") or m["key"]).strip().lower(): m
+               for m in metrics}
+    for pref in _PRIMARY_METRIC_PREFERENCE:
+        if pref in by_name:
+            return by_name[pref]["key"]
+    best = max(
+        metrics,
+        key=lambda m: (int(m.get("models_count") or 0), -ord(m["key"][:1] or " ")),
+    )
+    return best["key"]
+
+
 def _hierarchy_composite_benchmark(
     con, composite_slug: str, root: dict, slice_rows: list[dict]
 ) -> dict:
@@ -641,15 +1263,29 @@ def _hierarchy_composite_benchmark(
     (when one exists, e.g. `gaia` inside the `gaia` benchmark) is
     flagged with is_bare_stem=true so the frontend can render it as
     "Overall" / "Main".
+
+    Per `notes/hierarchy-alignment.md` §5.1, also emits:
+      - `primary_metric_key`: the canonical readout among this
+        benchmark's metrics (see `_pick_primary_metric_key`).
+      - `metrics[].is_primary`: True for the metric matching
+        `primary_metric_key`.
+      - `is_overall`: True when this benchmark IS the family/composite
+        root (canonical_id matches the family or composite key).
+        is_primary at the family level (across siblings) is added
+        later by the family-rollup pass.
     """
     benchmark_id = root["benchmark_id"]
+    # Pull metric meta + per-metric model coverage. models_count drives
+    # the primary-metric tie-break when no display name matches the
+    # preference list.
     metrics_rows = con.execute(
         """
         SELECT metric_id,
-               ANY_VALUE(metric_display_name) AS display_name,
+               ANY_VALUE(metric_display_name)              AS display_name,
                ARRAY_AGG(DISTINCT source_metadata.source_organization_name)
                    FILTER (WHERE source_metadata.source_organization_name IS NOT NULL)
-                   AS sources
+                   AS sources,
+               COUNT(DISTINCT model_key)                   AS models_count
         FROM eval_results_view
         WHERE composite_slug = ? AND benchmark_id = ?
         GROUP BY metric_id
@@ -664,11 +1300,43 @@ def _hierarchy_composite_benchmark(
         [composite_slug, benchmark_id],
     ).fetchone()
 
+    metrics: list[dict] = [
+        {
+            "key":           m[0],
+            "display_name":  m[1] or m[0],
+            "sources":       m[2] or [],
+            "models_count":  int(m[3] or 0),
+        }
+        for m in metrics_rows
+    ]
+    primary_metric_key = _pick_primary_metric_key(metrics)
+    for m in metrics:
+        m["is_primary"] = (m["key"] == primary_metric_key)
+
+    family_id = root.get("family_id") or benchmark_id
+    # is_overall is set by the family rollup pass (it's family-relative,
+    # not just benchmark-self-relative — a benchmark only IS the family
+    # root in the context of the family it gets rendered under). Default
+    # to False here; _mark_family_primary_benchmark flips the right one.
+
+    # Display name: curated `display_name` from canonical_benchmarks
+    # wins, but only when it actually differs from the slug. The
+    # auto-create path sets `display_name = benchmark_id` for unmatched
+    # raw strings (e.g. "format_sensitivity" / "memory"); prettify those
+    # so the UI doesn't show "format_sensitivity" verbatim.
+    raw_display = root.get("display_name")
+    if raw_display and raw_display != benchmark_id:
+        bench_display = raw_display
+    else:
+        bench_display = prettify_display(benchmark_id)
+
     return {
         "key":          benchmark_id,
-        "display_name": root.get("display_name") or benchmark_id,
-        "family_id":    root.get("family_id") or benchmark_id,
+        "display_name": bench_display,
+        "family_id":    family_id,
         "is_slice":     False,
+        "is_overall":   False,
+        "primary_metric_key": primary_metric_key,
         "has_card":     bool(root.get("card_present"))
                         if root.get("card_present") is not None else False,
         "tags": {
@@ -676,14 +1344,7 @@ def _hierarchy_composite_benchmark(
             "languages": list(root.get("languages") or []),
             "tasks":     list(root.get("tasks") or []),
         },
-        "metrics": [
-            {
-                "key":          m[0],
-                "display_name": m[1] or m[0],
-                "sources":      m[2] or [],
-            }
-            for m in metrics_rows
-        ],
+        "metrics":   metrics,
         "slices":   _hierarchy_composite_slices(
                         con, composite_slug, benchmark_id, slice_rows),
         "summary_eval_ids":        eval_ids_row[0] if eval_ids_row and eval_ids_row[0] else [],
@@ -755,20 +1416,26 @@ def _hierarchy_composite_slices(
     rows = con.execute(
         """
         WITH per_slice_metric AS (
+            -- The bound `?` benchmark parameter comes from the
+            -- benchmarks dim's `benchmark_id`, which under the
+            -- root-grain refactor is the canonical-or-raw key. Match
+            -- it against fr.benchmark_key (not the canonical-only
+            -- fr.benchmark_id) so raw-only benchmarks find their
+            -- slices.
             SELECT
                 fr.slice_key,
-                fr.metric_id,
+                fr.metric_key                            AS metric_id,
                 MIN(fr.slice_name)                       AS slice_name_rep,
                 ANY_VALUE(cmet.display_name)             AS metric_display,
                 ARRAY_AGG(DISTINCT fr.org_raw)
                     FILTER (WHERE fr.org_raw IS NOT NULL) AS sources
             FROM fact_results fr
-            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_id
+            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_key
             WHERE fr.composite_slug = ?
-              AND fr.benchmark_id = ?
+              AND fr.benchmark_key = ?
               AND fr.slice_key IS NOT NULL
-              AND fr.metric_id IS NOT NULL
-            GROUP BY fr.slice_key, fr.metric_id
+              AND fr.metric_key IS NOT NULL
+            GROUP BY fr.slice_key, fr.metric_key
         )
         SELECT
             slice_key,
@@ -1096,12 +1763,12 @@ def write_comparison_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
         """
         WITH metric_kinds AS (
             SELECT
-                benchmark_id,
-                metric_id,
+                benchmark_key,
+                metric_key,
                 MAX(metric_kind) FILTER (WHERE metric_kind IS NOT NULL) AS metric_kind
             FROM fact_results
-            WHERE benchmark_id IS NOT NULL AND metric_id IS NOT NULL
-            GROUP BY benchmark_id, metric_id
+            WHERE benchmark_key IS NOT NULL AND metric_key IS NOT NULL
+            GROUP BY benchmark_key, metric_key
         )
         SELECT
             erv.evaluation_id,
@@ -1119,11 +1786,13 @@ def write_comparison_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
             mv.developer,
             mk.metric_kind
         FROM eval_results_view erv
+        -- Join on model_key (root-grain identity) so unresolved models
+        -- still pick up models_view entries via the raw fallback.
         LEFT JOIN models_view mv
-          ON mv.model_id = erv.model_id
+          ON mv.model_key = erv.model_key
         LEFT JOIN metric_kinds mk
-          ON mk.benchmark_id = erv.benchmark_id
-         AND mk.metric_id    = erv.metric_id
+          ON mk.benchmark_key = erv.benchmark_id
+         AND mk.metric_key    = erv.metric_id
         WHERE erv.score             IS NOT NULL
           AND erv.evaluation_id     IS NOT NULL
           AND erv.metric_summary_id IS NOT NULL
@@ -1132,21 +1801,35 @@ def write_comparison_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
     ).fetchall()
     cols = [d[0] for d in con.description]
 
+    # parent_benchmark_id comes from the benchmarks dim. For roots
+    # (the eval *is* the benchmark) this is NULL; for slice rows it
+    # carries the parent benchmark's id so the frontend's
+    # getCompositeKey() fallback chain has a parent to fall back to.
+    # Use is_slice as the gate: canonical_benchmarks stores
+    # parent_benchmark_id == benchmark_id for roots in some cases, so
+    # null-out the root path explicitly rather than trusting the raw
+    # column value.
     eval_meta_rows = con.execute(
         """
         SELECT
-            evaluation_id,
-            evaluation_name,
-            canonical_display_name,
-            composite_slug,
-            composite_display_name,
-            family_id,
-            family_display_name,
-            is_slice,
-            category,
-            is_summary_score,
-            summary_eval_ids
-        FROM evals_view
+            ev.evaluation_id,
+            ev.evaluation_name,
+            ev.canonical_display_name,
+            ev.composite_slug,
+            ev.composite_display_name,
+            ev.benchmark_id,
+            ev.family_id,
+            ev.family_display_name,
+            ev.is_slice,
+            CASE WHEN ev.is_slice THEN b.parent_benchmark_id ELSE NULL END
+                AS parent_benchmark_id,
+            ev.category,
+            ev.is_summary_score,
+            ev.summary_eval_ids
+        FROM evals_view ev
+        LEFT JOIN benchmarks b
+          ON b.composite_slug = ev.composite_slug
+         AND b.benchmark_id   = ev.benchmark_id
         """
     ).fetchall()
     eval_meta_cols = [d[0] for d in con.description]
@@ -1242,8 +1925,10 @@ def write_comparison_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
             "eval_summary_id":         eval_id,
             "composite_slug":          meta.get("composite_slug"),
             "composite_display_name":  meta.get("composite_display_name"),
+            "benchmark_id":            meta.get("benchmark_id"),
             "family_id":               meta.get("family_id"),
             "family_display_name":     meta.get("family_display_name"),
+            "parent_benchmark_id":     meta.get("parent_benchmark_id"),
             "is_slice":                bool(meta.get("is_slice")),
             "display_name":            meta.get("canonical_display_name")
                                          or meta.get("evaluation_name"),
@@ -1265,6 +1950,100 @@ def write_comparison_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
         },
     }
     path = out_dir / "comparison-index.json"
+    path.write_text(json.dumps(payload, indent=2, default=_json_default))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# benchmark_index.json
+# ---------------------------------------------------------------------------
+
+
+def write_benchmark_index(con, out_dir: Path, snapshot_meta: dict) -> Path:
+    """Per-benchmark cross-composite appearance index.
+
+    Keyed by canonical `benchmark_id`. Each entry lists every composite
+    reporting that benchmark, with the primary-metric aggregate stats
+    pulled straight from `evals_view`.
+
+    Apples-to-apples warning: different composites can pick different
+    primary metrics for the same benchmark (e.g. MMLU as `accuracy` in
+    one composite and `normalized_accuracy` in another). Each appearance
+    carries its own `primary_metric_id` + display name so consumers can
+    detect heterogeneity and choose to compare directly, filter to a
+    shared metric, or normalise. We deliberately don't pre-bake any
+    cross-appearance roll-up: that's policy, and consumers can compute
+    weighted averages from `avg_score` × `models_count` themselves.
+
+    Slice rows (e.g. `gpqa-diamond` under `gpqa`) appear as their own
+    keys — they're benchmarks in the dim. `is_slice` and
+    `parent_benchmark_id` are at the entry level so consumers can fold
+    slices into their parent if they want to.
+    """
+    rows = con.execute(
+        """
+        SELECT
+            ev.benchmark_id,
+            ev.family_id,
+            ev.family_display_name,
+            ev.is_slice,
+            ev.parent_benchmark_id,
+            ev.composite_slug,
+            ev.composite_display_name,
+            ev.evaluation_id,
+            ev.primary_metric_id,
+            ev.metric_config.evaluation_description AS primary_metric_display_name,
+            ev.metric_config.lower_is_better        AS lower_is_better,
+            ev.metric_config.unit                   AS metric_unit,
+            ev.models_count,
+            ev.avg_score,
+            ev.top_score
+        FROM evals_view ev
+        WHERE ev.benchmark_id IS NOT NULL
+        ORDER BY ev.benchmark_id, ev.composite_slug
+        """
+    ).fetchall()
+    cols = [d[0] for d in con.description]
+
+    benchmarks: dict[str, dict] = {}
+    for r in rows:
+        rec = dict(zip(cols, r))
+        bid = rec["benchmark_id"]
+        entry = benchmarks.get(bid)
+        if entry is None:
+            entry = {
+                "family_id":           rec["family_id"] or bid,
+                "family_display_name": rec["family_display_name"]
+                                          or rec["family_id"]
+                                          or bid,
+                "is_slice":            bool(rec["is_slice"]),
+                "parent_benchmark_id": rec["parent_benchmark_id"],
+                "appearances":         [],
+            }
+            benchmarks[bid] = entry
+        entry["appearances"].append({
+            "composite_slug":              rec["composite_slug"],
+            "composite_display_name":      rec["composite_display_name"]
+                                              or rec["composite_slug"],
+            "evaluation_id":               rec["evaluation_id"],
+            "primary_metric_id":           rec["primary_metric_id"],
+            "primary_metric_display_name": rec["primary_metric_display_name"]
+                                              or rec["primary_metric_id"],
+            "lower_is_better":             None if rec["lower_is_better"] is None
+                                                else bool(rec["lower_is_better"]),
+            "metric_unit":                 rec["metric_unit"],
+            "avg_score":                   rec["avg_score"],
+            "top_score":                   rec["top_score"],
+            "models_count":                int(rec["models_count"] or 0),
+        })
+
+    payload = {
+        "generated_at":    snapshot_meta["snapshot_id"],
+        "config_version":  CONFIG_VERSION,
+        "benchmark_count": len(benchmarks),
+        "benchmarks":      benchmarks,
+    }
+    path = out_dir / "benchmark_index.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default))
     return path
 

@@ -273,13 +273,14 @@ def test_pipeline_end_to_end(tmp_path, monkeypatch):
     # No collisions in this fixture; the counter is still expected to be present.
     assert snap["row_counts"]["dropped_rows_dedup"] == 0
     # Stage J ran end-to-end: tables list extends with the 3 view parquets,
-    # sidecars list carries the 3 JSON files.
+    # sidecars list carries the JSON files emitted by Stage J.
     assert "fact_results.parquet" in snap["tables"]
     assert "eval_results_view.parquet" in snap["tables"]
     assert "models_view.parquet" in snap["tables"]
     assert "evals_view.parquet" in snap["tables"]
     assert set(snap["sidecars"]) == {
         "manifest.json", "headline.json", "hierarchy.json",
+        "benchmark_index.json",
     }
 
     # comparability_group_id is the full md5 (32 hex chars), not truncated.

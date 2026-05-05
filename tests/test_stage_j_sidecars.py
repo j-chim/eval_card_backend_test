@@ -63,6 +63,7 @@ def _materialise_views_and_sidecars(out_dir: Path):
     sidecars.write_headline(con, out_dir, snap)
     sidecars.write_hierarchy(con, out_dir, snap)
     sidecars.write_comparison_index(con, out_dir, snap)
+    sidecars.write_benchmark_index(con, out_dir, snap)
     return con
 
 
@@ -102,6 +103,7 @@ def test_manifest_summary_artifact_pointers(tmp_path, monkeypatch):
     assert manifest["summary_artifacts"]["corpus_aggregates"] == "headline.json"
     assert manifest["summary_artifacts"]["eval_hierarchy"] == "hierarchy.json"
     assert manifest["summary_artifacts"]["comparison_index"] == "comparison-index.json"
+    assert manifest["summary_artifacts"]["benchmark_index"] == "benchmark_index.json"
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +185,19 @@ def test_categories_list_typed(tmp_path, monkeypatch):
 
 
 def test_hierarchy_top_level_shape(tmp_path, monkeypatch):
-    """New shape: composites[] (primary tree) + families[] (lookup index)."""
+    """v3 shape: families[] is the rich top-level entity. Composites
+    nest under families[].composites[] when a family has multiple
+    distinct named groupings; otherwise the family uses
+    standalone_benchmarks[] (single-bench) or benchmarks[] (flat)
+    layouts. See notes/hierarchy-alignment.md §5.1."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
-    assert {"generated_at", "stats", "composites", "families"} <= hi.keys()
+    assert {"schema_version", "generated_at", "stats", "families"} <= hi.keys()
+    assert hi["schema_version"] == "v3.hierarchy.1"
+    # Top-level composites[] is gone — composites nest inside families.
+    assert "composites" not in hi
     s = hi["stats"]
     assert {
         "composite_count", "family_count", "benchmark_count",
@@ -196,50 +205,64 @@ def test_hierarchy_top_level_shape(tmp_path, monkeypatch):
     } <= s.keys()
 
 
-def test_hierarchy_composites_have_required_keys(tmp_path, monkeypatch):
+def test_hierarchy_families_have_layout(tmp_path, monkeypatch):
+    """Each family carries exactly one of standalone_benchmarks /
+    benchmarks / composites. Top-level family fields (key, display_name,
+    category, tags, evals_count, eval_summary_ids, signal summaries)
+    are always present."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
-    assert hi["composites"], "no composites in hierarchy"
-    for c in hi["composites"]:
+    assert hi["families"], "no families in hierarchy"
+    for fam in hi["families"]:
         assert {
             "key", "display_name", "category", "tags",
-            "evals_count", "benchmarks",
-        } <= c.keys()
-        assert isinstance(c["benchmarks"], list)
-        for b in c["benchmarks"]:
-            assert {
-                "key", "display_name", "family_id", "is_slice",
-                "tags", "metrics", "slices", "summary_eval_ids",
-            } <= b.keys()
+            "evals_count", "eval_summary_ids",
+            "reproducibility_summary", "provenance_summary",
+            "comparability_summary",
+        } <= fam.keys()
+        layouts = [k for k in ("standalone_benchmarks", "benchmarks", "composites")
+                   if k in fam]
+        assert len(layouts) == 1, (
+            f"family {fam['key']!r} should have exactly one layout, has {layouts!r}"
+        )
 
 
-def test_hierarchy_families_index_shape(tmp_path, monkeypatch):
-    """families[] is a flat lookup: one entry per family_id with the
-    list of member benchmark keys. No nested benchmarks."""
+def test_hierarchy_benchmark_records_intact(tmp_path, monkeypatch):
+    """Per-benchmark fields (key, display_name, family_id, is_slice,
+    tags, metrics, slices, summary_eval_ids) are preserved through the
+    family-rooted reshape."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
+
+    benches: list[dict] = []
     for fam in hi["families"]:
-        assert {"key", "display_name", "member_benchmark_keys"} <= fam.keys()
-        assert isinstance(fam["member_benchmark_keys"], list)
-        # No legacy nested fields:
-        assert "composites" not in fam
-        assert "standalone_benchmarks" not in fam
+        benches.extend(fam.get("standalone_benchmarks") or [])
+        benches.extend(fam.get("benchmarks") or [])
+        for c in fam.get("composites") or []:
+            benches.extend(c.get("benchmarks") or [])
+    assert benches, "no benchmarks across all families"
+    for b in benches:
+        assert {
+            "key", "display_name", "family_id", "is_slice",
+            "tags", "metrics", "slices", "summary_eval_ids",
+        } <= b.keys()
 
 
-def test_hierarchy_legacy_field_names_absent(tmp_path, monkeypatch):
-    """The legacy benchmark-stem-keyed `families[].composites[]` /
-    `families[].standalone_benchmarks[]` shape is gone (AC-7)."""
+def test_hierarchy_legacy_top_level_composites_absent(tmp_path, monkeypatch):
+    """v3 dropped top-level composites[] — they nest inside
+    families[].composites[]. Guards against accidental schema reversion."""
     pytest.importorskip("duckdb")
     out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
     _materialise_views_and_sidecars(out)
     hi = json.loads((out / "hierarchy.json").read_text())
-    body = json.dumps(hi)
-    assert "standalone_benchmarks" not in body
-    assert "benchmark_family_key" not in body
+    assert "composites" not in hi.keys()
+    # The thin family-lookup shape from v2 (families[] entries with just
+    # member_benchmark_keys) is also gone.
+    assert all("member_benchmark_keys" not in f for f in hi["families"])
 
 
 def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
@@ -406,6 +429,7 @@ def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
             'gpqa' AS benchmark_id,
             'accuracy' AS metric_id,
             'Accuracy' AS metric_display_name,
+            'openai/gpt-5' AS model_key,
             struct_pack(source_organization_name := 'WASP') AS source_metadata
         UNION ALL
         SELECT
@@ -413,6 +437,7 @@ def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
             'gpqa-diamond',
             'accuracy',
             'Accuracy',
+            'openai/gpt-5',
             struct_pack(source_organization_name := 'WASP')
         """
     )
@@ -425,7 +450,13 @@ def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
             slice_name VARCHAR,
             metric_id VARCHAR,
             model_key VARCHAR,
-            org_raw VARCHAR
+            org_raw VARCHAR,
+            -- Aggregation keys mirror canonical ids in this synthetic
+            -- test (no resolution-failure cases). Computed columns
+            -- preserve the original 7-column INSERT shape.
+            benchmark_key VARCHAR AS (benchmark_id),
+            metric_key VARCHAR AS (metric_id),
+            model_aggregation_key VARCHAR AS (model_key)
         )
         """
     )
@@ -448,15 +479,20 @@ def test_hierarchy_gpqa_diamond_emits_as_benchmark_not_slice(tmp_path):
     )
     hierarchy = json.loads((tmp_path / "hierarchy.json").read_text())
 
-    wasp = next(c for c in hierarchy["composites"] if c["key"] == "wasp")
-    assert [b["key"] for b in wasp["benchmarks"]] == ["gpqa", "gpqa-diamond"]
+    # v3 shape: composites nest under families. The wasp composite's
+    # benchmarks live at hierarchy.families[?].composites[?].benchmarks[]
+    # — the test's synthetic input doesn't load canonical_composites
+    # with a curated family_id, so the wasp composite ends up as its
+    # own singleton family (family.id == composite.id == "wasp").
+    wasp_family = next(f for f in hierarchy["families"] if f["key"] == "wasp")
+    # Single composite, multiple benchmarks → flat benchmarks[] layout.
+    bench_keys = [b["key"] for b in wasp_family.get("benchmarks", [])]
+    assert bench_keys == ["gpqa", "gpqa-diamond"]
     assert all(
         s["key"] != "gpqa-diamond"
-        for b in wasp["benchmarks"]
+        for b in wasp_family["benchmarks"]
         for s in b["slices"]
     )
-    gpqa_family = next(f for f in hierarchy["families"] if f["key"] == "gpqa")
-    assert gpqa_family["member_benchmark_keys"] == ["gpqa", "gpqa-diamond"]
 
 
 def test_metric_count_matches_distinct_composite_benchmark_metric_triples(
@@ -559,7 +595,10 @@ def test_comparison_index_eval_entry_required_fields(tmp_path, monkeypatch):
     assert {
         "eval_summary_id",
         "composite_slug", "composite_display_name",
-        "family_id", "family_display_name", "is_slice",
+        "benchmark_id",
+        "family_id", "family_display_name",
+        "parent_benchmark_id",
+        "is_slice",
         "display_name", "category", "is_summary_score",
         "summary_score_for", "summary_eval_ids", "metrics",
     } <= set(sample.keys())
@@ -645,3 +684,103 @@ def test_comparison_index_by_model_inverse_consistent(tmp_path, monkeypatch):
                 assert forward["score"] == by_model_entry["score"]
                 assert forward["rank"]  == by_model_entry["rank"]
                 assert forward["total"] == by_model_entry["total"]
+
+
+# ---------------------------------------------------------------------------
+# benchmark_index.json
+# ---------------------------------------------------------------------------
+
+
+def test_benchmark_index_top_level_shape(tmp_path, monkeypatch):
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    bi = json.loads((out / "benchmark_index.json").read_text())
+    assert {"generated_at", "config_version", "benchmark_count", "benchmarks"} <= bi.keys()
+    assert isinstance(bi["benchmarks"], dict)
+    assert bi["benchmark_count"] == len(bi["benchmarks"])
+
+
+def test_benchmark_index_entries_have_required_keys(tmp_path, monkeypatch):
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    bi = json.loads((out / "benchmark_index.json").read_text())
+    assert bi["benchmarks"], "no benchmarks in benchmark_index.json"
+    for bid, entry in bi["benchmarks"].items():
+        assert {
+            "family_id", "family_display_name", "is_slice",
+            "parent_benchmark_id", "appearances",
+        } <= entry.keys()
+        assert isinstance(entry["appearances"], list)
+        assert entry["appearances"], f"benchmark {bid} has no appearances"
+        for app in entry["appearances"]:
+            assert {
+                "composite_slug", "composite_display_name", "evaluation_id",
+                "primary_metric_id", "primary_metric_display_name",
+                "lower_is_better", "metric_unit",
+                "avg_score", "top_score", "models_count",
+            } <= app.keys()
+
+
+def test_benchmark_index_keyset_matches_evals_view(tmp_path, monkeypatch):
+    """Every benchmark_id in evals_view must appear in the index, and vice
+    versa. Source-of-truth check: the index is a re-shape of evals_view."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    con = _materialise_views_and_sidecars(out)
+    bi = json.loads((out / "benchmark_index.json").read_text())
+    view_keys = {
+        r[0] for r in con.execute(
+            "SELECT DISTINCT benchmark_id FROM evals_view "
+            "WHERE benchmark_id IS NOT NULL"
+        ).fetchall()
+    }
+    assert set(bi["benchmarks"].keys()) == view_keys
+
+
+def test_benchmark_index_appearances_match_evals_view_stats(tmp_path, monkeypatch):
+    """For each (benchmark_id, composite_slug) appearance in the index,
+    avg_score / top_score / models_count / primary_metric_id must equal
+    the corresponding row in evals_view. Catches any reshape that drops
+    or recomputes columns instead of carrying them through.
+    """
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    con = _materialise_views_and_sidecars(out)
+    bi = json.loads((out / "benchmark_index.json").read_text())
+    rows = con.execute(
+        """
+        SELECT benchmark_id, composite_slug, primary_metric_id,
+               avg_score, top_score, models_count
+        FROM evals_view
+        WHERE benchmark_id IS NOT NULL
+        """
+    ).fetchall()
+    expected = {
+        (bid, slug): (pmid, avg, top, int(mc or 0))
+        for (bid, slug, pmid, avg, top, mc) in rows
+    }
+    seen: set[tuple[str, str]] = set()
+    for bid, entry in bi["benchmarks"].items():
+        for app in entry["appearances"]:
+            key = (bid, app["composite_slug"])
+            assert key in expected, f"unexpected appearance {key}"
+            pmid, avg, top, mc = expected[key]
+            assert app["primary_metric_id"] == pmid
+            assert app["avg_score"]         == avg
+            assert app["top_score"]         == top
+            assert app["models_count"]      == mc
+            seen.add(key)
+    assert seen == set(expected.keys()), "missing appearances vs. evals_view"
+
+
+def test_benchmark_index_appearances_sorted_by_composite(tmp_path, monkeypatch):
+    """Appearances are ordered by composite_slug for stable diffs."""
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    _materialise_views_and_sidecars(out)
+    bi = json.loads((out / "benchmark_index.json").read_text())
+    for entry in bi["benchmarks"].values():
+        slugs = [a["composite_slug"] for a in entry["appearances"]]
+        assert slugs == sorted(slugs)

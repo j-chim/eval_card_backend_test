@@ -404,28 +404,41 @@ def run(
                 "results_exploded missing; synthesised_id_collisions = None"
             )
     # When Stage E was restored from cache rather than re-run, recover row
-    # counts from the cached tables. The per-reason drop breakdown isn't
-    # recoverable from the cached output alone, so n_dropped_sentinel and
-    # n_dropped_dedup land as None — the warehouse is still consistent;
-    # snapshot_meta surfaces nulls for the missing breakdowns.
+    # counts from the cached tables. Sentinel and dedup breakdowns are
+    # re-derived: the sentinel predicate is pure SQL against
+    # `fact_results_staging`, and dedup count = pre - no_score - sentinel
+    # - post. This keeps `snapshot_meta.row_counts` accurate across
+    # `--from-stage F+` reruns instead of zeroing out two real signals.
     if stage_e_stats is None:
         pre_count = _table_count(con, "fact_results_staging")
         post_count = _table_count(con, "fact_results_signaled")
         n_no_score = None
+        n_sentinel = None
+        n_dedup = None
         if pre_count is not None:
             try:
                 n_no_score = con.execute(
                     "SELECT count(*) FROM fact_results_staging WHERE score IS NULL"
                 ).fetchone()[0]
+                n_sentinel = con.execute(
+                    f"SELECT count(*) FROM fact_results_staging "
+                    f"WHERE score IS NOT NULL "
+                    f"AND ({stages._SENTINEL_DROP_PREDICATE})"
+                ).fetchone()[0]
+                if post_count is not None:
+                    n_dedup = max(
+                        0,
+                        pre_count - n_no_score - n_sentinel - post_count,
+                    )
             except duckdb.CatalogException:
                 log.warning(
-                    "fact_results_staging missing; dropped_rows_no_score = None"
+                    "fact_results_staging missing; Stage E breakdowns = None"
                 )
         stage_e_stats = stages.StageEStats(
             pre=pre_count if pre_count is not None else 0,
             n_dropped_no_score=n_no_score if n_no_score is not None else 0,
-            n_dropped_sentinel=0,  # not recoverable from cache; assume 0
-            n_dropped_dedup=0,     # ditto
+            n_dropped_sentinel=n_sentinel if n_sentinel is not None else 0,
+            n_dropped_dedup=n_dedup if n_dedup is not None else 0,
             post=post_count if post_count is not None else 0,
         )
     if not chosen:
@@ -464,8 +477,10 @@ def run(
         sidecars.write_headline(con, out_dir, meta)
         sidecars.write_hierarchy(con, out_dir, meta)
         sidecars.write_comparison_index(con, out_dir, meta)
+        sidecars.write_benchmark_index(con, out_dir, meta)
         log.info(
-            "Stage J: wrote sidecars (manifest, headline, hierarchy, comparison-index) to %s",
+            "Stage J: wrote sidecars (manifest, headline, hierarchy, "
+            "comparison-index, benchmark_index) to %s",
             out_dir,
         )
 
@@ -546,7 +561,10 @@ def _build_snapshot_meta(
             "models_view.parquet",
             "evals_view.parquet",
         ]
-        sidecars = ["manifest.json", "headline.json", "hierarchy.json"]
+        sidecars = [
+            "manifest.json", "headline.json", "hierarchy.json",
+            "benchmark_index.json",
+        ]
 
     # Single HTTP call per upstream — captures both sha and last_modified
     # so manifest.json can surface "registry parquet was last refreshed

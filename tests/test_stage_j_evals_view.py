@@ -70,6 +70,7 @@ def test_evals_view_columns_match_spec(tmp_path, monkeypatch):
         "evaluation_name", "canonical_display_name",
         "composite_slug", "composite_display_name",
         "family_id", "family_display_name", "is_slice",
+        "parent_benchmark_id",
         "category",
         "metric_config",
         "models_count", "evaluator_names", "source_types",
@@ -94,6 +95,41 @@ def test_evals_view_columns_match_spec(tmp_path, monkeypatch):
     assert "composite_benchmark_key" not in cols
     assert "benchmark_family_key" not in cols
     assert "benchmark_leaf_key" not in cols
+    # Hierarchy-alignment §5.3 column types — frontend filters read
+    # these scalars without a dim join.
+    assert cols["composite_slug"] == "VARCHAR"
+    assert cols["family_id"] == "VARCHAR"
+    assert cols["parent_benchmark_id"] == "VARCHAR"
+
+
+def test_evals_view_excludes_factless_parent_shells(tmp_path, monkeypatch):
+    """evals_view ships only benchmarks with at least one fact row. The
+    benchmarks dim deliberately includes fact-less parent shells (so the
+    hierarchy graph resolves) — but those aren't navigable evals and
+    should not appear in the user-facing view. Aligns with
+    comparison-index, which is built from per-(eval, metric) buckets and
+    excludes them by construction.
+    """
+    pytest.importorskip("duckdb")
+    out = _run_through_stage_i(tmp_path, monkeypatch, "fixtures_clean")
+    con = _materialise_views(out)
+    factless = con.execute(
+        """
+        SELECT e.composite_slug, e.benchmark_id
+        FROM evals_view e
+        WHERE NOT EXISTS (
+            SELECT 1 FROM read_parquet(?) f
+            WHERE f.composite_slug = e.composite_slug
+              AND f.benchmark_key  = e.benchmark_id
+        )
+        """,
+        [f"{out}/fact_results.parquet"],
+    ).fetchall()
+    assert factless == [], (
+        f"evals_view contains fact-less parent shells: {factless}. "
+        f"These are dim rows for hierarchy support; they don't belong in "
+        f"the eval list."
+    )
 
 
 def test_evaluation_id_is_composite_slash_benchmark(tmp_path, monkeypatch):

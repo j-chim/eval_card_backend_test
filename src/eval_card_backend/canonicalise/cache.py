@@ -160,6 +160,16 @@ class StageCache:
         """Restore every cached output table for stages A .. last_stage.
 
         Returns the list of restored tables for logging.
+
+        Tables that aren't on disk are silently skipped — this is
+        intentional, since some uses (tests, partial-stage scenarios)
+        deliberately cache only a subset. The downside is that schema
+        drift from a STAGE_OUTPUTS change in a newer pipeline version
+        produces a cryptic `CatalogException: table not found` later
+        rather than a clear "delete the stale cache" message here. If
+        you hit a CatalogException early in a `--from-stage` rerun, the
+        likely fix is `rm -rf .cache/canonicalise/<snapshot>` so the
+        cache is rebuilt against the current STAGE_OUTPUTS layout.
         """
         restored: list[str] = []
         for stage in STAGE_ORDER:

@@ -96,6 +96,9 @@ def test_view_columns_match_spec(tmp_path, monkeypatch):
         "first_party_only", "has_variant_divergence", "has_cross_party_divergence",
         "evalcards_annotations",
         "instance_file_path", "instance_file_format", "instance_rows",
+        # Hierarchy-alignment §5.3: family / composite columns surface
+        # on the view so frontend filters don't need a dim join.
+        "composite_slug", "family_id", "is_slice", "parent_benchmark_id",
     }
     missing = expected - cols.keys()
     assert not missing, f"missing columns: {missing}"
@@ -106,6 +109,10 @@ def test_view_columns_match_spec(tmp_path, monkeypatch):
     assert cols["score"] == "DOUBLE"
     assert cols["position"] == "INTEGER"
     assert cols["coverage_cell"] == "VARCHAR"
+    # Hierarchy-alignment §5.3 column types.
+    assert cols["composite_slug"] == "VARCHAR"
+    assert cols["family_id"] == "VARCHAR"
+    assert cols["parent_benchmark_id"] == "VARCHAR"
 
 
 # ---------------------------------------------------------------------------

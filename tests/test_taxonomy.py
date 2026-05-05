@@ -44,13 +44,14 @@ hal:
 
 
 def test_composite_display_only_default_config_inferred(tmp_path):
-    """Display-only override implicitly maps slug → [slug-with-underscores]."""
+    """Display-only override implicitly maps slug → [kebab, snake] so the
+    JOIN matches whichever form upstream EEE uses."""
     _write(tmp_path, "composites.yaml", """
 helm-classic:
   display: HELM Classic
 """)
     out = taxonomy.load_composites(tmp_path)
-    assert out["helm-classic"]["configs"] == ["helm_classic"]
+    assert out["helm-classic"]["configs"] == ["helm-classic", "helm_classic"]
 
 
 def test_composite_validation_duplicate_config(tmp_path):

@@ -99,7 +99,9 @@ def test_fixture_02_no_match_model_keeps_row(tmp_path, monkeypatch):
     """02 has a model with no alias entry. The row must be PRESERVED (raw kept,
     canonical NULL) — never dropped for unresolved identity. `model_key`
     falls back to `model_raw` so downstream stages can still address the
-    row."""
+    row, and group signals pool by `model_aggregation_key` (which falls
+    back to `model_raw` too) so unresolved models still participate in
+    comparability groups when their raw strings match."""
     out = _run_pipeline_per_config(tmp_path, monkeypatch, "fixtures_clean")
     df = _facts(out)
 
@@ -116,10 +118,11 @@ def test_fixture_02_no_match_model_keeps_row(tmp_path, monkeypatch):
     # Other entities still resolve
     assert row02["benchmark_id"] == "mmlu"
     assert row02["metric_id"] == "accuracy"
-    # Group signals NULL because model_id is NULL
-    assert row02["comparability_group_id"] is None or (
-        row02["comparability_group_id"] != row02["comparability_group_id"]
-    )
+    # Group signals are computed via raw fallback: with all three
+    # aggregation keys present (model_raw + benchmark_id + metric_id),
+    # the row participates in a comparability group.
+    assert row02["comparability_group_id"] is not None
+    assert row02["comparability_group_id"] == row02["comparability_group_id"]
 
 
 def test_fixture_02_unresolved_surfaces_in_models_parquet(tmp_path, monkeypatch):

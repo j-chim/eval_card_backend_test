@@ -1,23 +1,28 @@
 """Composite / family / slice taxonomy loader.
 
-Reads three curated YAML files from the registry seed directory and
+Reads curated taxonomy data from the registry data cache and
 materialises three small in-memory tables on the DuckDB connection:
 
 - `composite_config_map(source_config, composite_slug, composite_display_name)`
 - `family_membership(family_id, family_display_name, benchmark_id)`
 - `slice_promotions(benchmark_id)`
 
-The YAMLs live in `evalcard-registry/seed/`:
-- `composites.yaml`  — leaderboard slug → list of EEE source_configs
-- `families.yaml`    — multi-benchmark family slug → list of benchmark ids
-- `slice_overrides.yaml` — `promote_to_benchmark: [...]`
+**Source preference** (per `notes/hierarchy-alignment.md` §4 — the
+registry curation home):
 
-Phase 1 (this module) reads from a configurable filesystem path. Phase 2
-will move these into the registry's parquet dim tables (see
-`notes/09-…` §9). The path defaults to `<registry_local_dir>/../seed/`,
-which is correct for the workspace layout where eval-card-backend and
-evalcard-registry are sibling clones. Missing files are tolerated: an
-absent YAML produces an empty table (no curated entries → all defaults).
+  1. Parquet from `<registry_local_dir>/canonical_composites.parquet`
+     and `canonical_families.parquet`. Single source of truth. Shipped
+     alongside the rest of the registry data via
+     `eval-card-registry/scripts/publish_registry_data.py`.
+  2. YAML fallback at `<registry_local_dir>/../{eval-card-registry,
+     evalcard-registry}/seed/`. Used when the registry's published
+     dataset predates the canonical_families / canonical_composites
+     tables (back-compat) or when running against a sibling registry
+     checkout in development.
+
+`slice_overrides.yaml` is shipped as YAML alongside the parquets (see
+the publish script's SHIPPED_YAML list). The producer reads it from
+the registry cache first, then from the seed dir as fallback.
 """
 from __future__ import annotations
 
@@ -132,9 +137,13 @@ def load_composites(seed_dir: Path) -> dict[str, dict]:
         display = entry.get("display") or slug
         configs = entry.get("configs")
         if configs is None:
-            # Display-only override: implicit single config = the slug
-            # itself (e.g. helm-classic → [helm_classic]).
-            configs = [slug.replace("-", "_")]
+            # Display-only override (no explicit `configs:`): emit the
+            # slug in both kebab and snake forms so the JOIN matches
+            # whichever the upstream EEE folder uses (e.g. `arc-agi` is
+            # kebab, `helm_classic` is snake).
+            kebab = slug
+            snake = slug.replace("-", "_")
+            configs = [kebab] if kebab == snake else [kebab, snake]
         if not isinstance(configs, list):
             log.warning(
                 "composites.yaml: %r.configs must be a list, got %s",
@@ -267,37 +276,191 @@ def materialise_taxonomy_tables(
         )
 
 
+def load_composites_from_parquet(registry_root: Path) -> dict[str, dict] | None:
+    """Read composites from the registry's `canonical_composites.parquet`
+    in the data cache. Returns None when the parquet is missing — caller
+    falls back to the YAML loader.
+
+    Output shape matches `load_composites`:
+        {composite_slug: {display: str, configs: [str, ...]}}
+    `source_configs` on the parquet is JSON-encoded; we decode tolerantly.
+    """
+    import json as _json
+
+    candidates = [
+        registry_root / "canonical_composites.parquet",
+        registry_root / "canonical_composites" / "part-0.parquet",
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        return None
+    try:
+        import pandas as pd
+        df = pd.read_parquet(path)
+    except (OSError, ValueError, ImportError) as exc:
+        log.warning("taxonomy: failed to read %s: %s", path, exc)
+        return None
+
+    out: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        slug = row.get("id")
+        if not isinstance(slug, str):
+            continue
+        display = row.get("display_name") or slug
+        raw = row.get("source_configs")
+        configs: list[str]
+        if isinstance(raw, list):
+            configs = [str(c) for c in raw]
+        elif isinstance(raw, str) and raw.strip() and raw.strip() not in ("[]", "null"):
+            try:
+                decoded = _json.loads(raw)
+                configs = [str(c) for c in decoded] if isinstance(decoded, list) else []
+            except (ValueError, TypeError):
+                configs = []
+        else:
+            configs = []
+        if not configs:
+            # Display-only entries default to slug-as-config (replaces the
+            # YAML loader's `slug.replace("-", "_")` heuristic).
+            configs = [slug.replace("-", "_")]
+        out[slug] = {"display": str(display), "configs": configs}
+    return out
+
+
+def load_families_from_parquet(registry_root: Path) -> dict[str, dict] | None:
+    """Read families from the registry's `canonical_families.parquet`.
+    Returns None on missing file. Output matches `load_families`.
+
+    `benchmark_ids` is JSON-encoded on the parquet.
+    """
+    import json as _json
+
+    candidates = [
+        registry_root / "canonical_families.parquet",
+        registry_root / "canonical_families" / "part-0.parquet",
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        return None
+    try:
+        import pandas as pd
+        df = pd.read_parquet(path)
+    except (OSError, ValueError, ImportError) as exc:
+        log.warning("taxonomy: failed to read %s: %s", path, exc)
+        return None
+
+    out: dict[str, dict] = {}
+    seen_benchmarks: dict[str, str] = {}
+    for _, row in df.iterrows():
+        fid = row.get("id")
+        if not isinstance(fid, str):
+            continue
+        display = row.get("display_name") or fid
+        raw = row.get("benchmark_ids")
+        bench_ids: list[str]
+        if isinstance(raw, list):
+            bench_ids = [str(b) for b in raw]
+        elif isinstance(raw, str) and raw.strip() and raw.strip() not in ("[]", "null"):
+            try:
+                decoded = _json.loads(raw)
+                bench_ids = [str(b) for b in decoded] if isinstance(decoded, list) else []
+            except (ValueError, TypeError):
+                bench_ids = []
+        else:
+            bench_ids = []
+        for bid in bench_ids:
+            prior = seen_benchmarks.get(bid)
+            if prior is not None and prior != fid:
+                raise ValueError(
+                    f"canonical_families.parquet: benchmark {bid!r} appears "
+                    f"in both {prior!r} and {fid!r}."
+                )
+            seen_benchmarks[bid] = fid
+        out[fid] = {"display": str(display), "benchmarks": bench_ids}
+    return out
+
+
+def load_slice_promotions_from_registry(registry_root: Path) -> set[str] | None:
+    """Read slice_promotions from `<registry_root>/slice_overrides.yaml`
+    (shipped alongside the parquets by the registry's publish script).
+    Returns None when the file isn't there — caller falls back to the
+    seed-dir YAML loader."""
+    path = registry_root / "slice_overrides.yaml"
+    if not path.exists():
+        return None
+    return load_slice_promotions(registry_root)
+
+
 def load_and_materialise(
     con,
     registry_root: Path | None,
     seed_dir_override: Path | None = None,
 ) -> tuple[dict[str, dict], dict[str, dict], set[str]]:
-    """One-shot helper: resolve seed dir, load YAMLs, materialise tables.
+    """One-shot helper: resolve sources, load curation, materialise tables.
+
+    Source preference (parquet → YAML fallback): see module docstring.
 
     Returns the parsed data so Stage A's slice-grouping pass can see the
-    promotion set without re-reading the file.
+    promotion set without re-reading.
     """
-    seed_dir = resolve_seed_dir(registry_root, seed_dir_override)
-    if seed_dir is None:
-        raise RuntimeError(
-            "taxonomy: no seed dir found "
-            f"(override={seed_dir_override!r}, registry_root={registry_root!r}). "
-            "The curated composite/family/slice YAMLs are required — without them, "
-            "composite_slug falls back to kebab-case(source_config) and "
-            "composite_display_name falls back to the per-record EEE "
-            "source_metadata.source_name. That is non-deterministic for any "
-            "leaderboard whose source_name varies per record (Vals.ai, reward-bench, "
-            "Wasp), and silently splits multi-config leaderboards into per-config "
-            "composites. Fix: set EVALCARD_REGISTRY_SEED_DIR, pass "
-            "--taxonomy-seed-dir, or check out eval-card-registry/ as a sibling of "
-            "this repo so resolve_seed_dir() can find the YAMLs. To intentionally "
-            "run without a curated taxonomy, pass an explicit empty-but-existing "
-            "directory as the override."
-        )
-    log.info("taxonomy: loading seed YAMLs from %s", seed_dir)
-    composites = load_composites(seed_dir)
-    families = load_families(seed_dir)
-    promotions = load_slice_promotions(seed_dir)
+    composites: dict[str, dict] | None = None
+    families: dict[str, dict] | None = None
+    promotions: set[str] | None = None
+
+    # 1. Try the registry data cache first (canonical_*.parquet +
+    #    YAML overrides shipped alongside).
+    if registry_root is not None and registry_root.exists():
+        composites = load_composites_from_parquet(registry_root)
+        families = load_families_from_parquet(registry_root)
+        promotions = load_slice_promotions_from_registry(registry_root)
+        loaded_from = []
+        if composites is not None:
+            loaded_from.append("canonical_composites.parquet")
+        if families is not None:
+            loaded_from.append("canonical_families.parquet")
+        if promotions is not None:
+            loaded_from.append("slice_overrides.yaml")
+        if loaded_from:
+            log.info(
+                "taxonomy: loaded from registry cache %s — %s",
+                registry_root, ", ".join(loaded_from),
+            )
+
+    # 2. YAML fallback for any source the registry cache didn't have.
+    needs_yaml = composites is None or families is None or promotions is None
+    if needs_yaml:
+        seed_dir = resolve_seed_dir(registry_root, seed_dir_override)
+        if seed_dir is None:
+            raise RuntimeError(
+                "taxonomy: no taxonomy source found. Tried registry cache "
+                f"({registry_root!r}) for canonical_*.parquet and "
+                f"slice_overrides.yaml; tried seed dir resolution for fallback "
+                f"YAMLs (override={seed_dir_override!r}). The producer needs at "
+                f"least one of: a registry data snapshot with the new "
+                f"canonical_families/canonical_composites tables, OR a sibling "
+                f"eval-card-registry checkout with seed/, OR an explicit "
+                f"--taxonomy-seed-dir / EVALCARD_REGISTRY_SEED_DIR override. "
+                f"Without curated taxonomy, composite_slug falls back to "
+                f"kebab-case(source_config) and silently splits multi-config "
+                f"leaderboards (Vals.ai, RewardBench, WASP)."
+            )
+        if composites is None:
+            composites = load_composites(seed_dir)
+            log.info("taxonomy: loaded composites from YAML at %s", seed_dir)
+        if families is None:
+            families = load_families(seed_dir)
+            log.info("taxonomy: loaded families from YAML at %s", seed_dir)
+        if promotions is None:
+            promotions = load_slice_promotions(seed_dir)
+            log.info("taxonomy: loaded slice_promotions from YAML at %s", seed_dir)
+
+    # composites / families / promotions are guaranteed non-None here
+    # (parquet paths return {} or set() for empty rather than None;
+    # YAML paths similarly default to empty containers).
+    composites = composites or {}
+    families = families or {}
+    promotions = promotions or set()
+
     log.info(
         "taxonomy: %d composite(s), %d curated family(ies), "
         "%d slice promotion(s)",

@@ -13,11 +13,21 @@ Layout on disk after snapshot (the registry's HF dataset shape):
     <local_dir>/canonical_orgs/part-0.parquet
     <local_dir>/canonical_models/part-0.parquet
     <local_dir>/canonical_benchmarks/part-0.parquet
+    <local_dir>/canonical_families/part-0.parquet     (added 2026-05-05)
+    <local_dir>/canonical_composites/part-0.parquet   (added 2026-05-05)
     <local_dir>/canonical_metrics/part-0.parquet
     <local_dir>/eval_harnesses/part-0.parquet
+    <local_dir>/manifest.json                          (added 2026-05-05)
+
+`manifest.json` carries `schema_version` (registry.<MAJOR>.<MINOR>);
+this module asserts the major matches `EXPECTED_REGISTRY_SCHEMA_MAJOR`
+at snapshot-load time so a registry breaking change that ships before
+the producer is updated fails fast with a clear error rather than
+producing garbage downstream.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -28,10 +38,26 @@ log = logging.getLogger(__name__)
 
 from eval_card_backend.config import ENTITY_REGISTRY_DATASET_REPO
 
+# Registry schema major. Bumped when the registry removes/renames a
+# column the producer reads. Minor bumps (additive columns) don't
+# require a producer change. Coordinated with
+# `eval-card-registry/scripts/publish_registry_data.py:SCHEMA_VERSION`.
+EXPECTED_REGISTRY_SCHEMA_MAJOR = 2
+
+
+class RegistrySchemaMismatch(RuntimeError):
+    """Raised when the registry snapshot's manifest.json declares a
+    schema_version major that the producer wasn't built for. Crash
+    early — running with a mismatched registry corrupts downstream
+    canonicalisation in subtle ways."""
+
+
 DIM_TABLES: tuple[str, ...] = (
     "canonical_orgs",
     "canonical_models",
     "canonical_benchmarks",
+    "canonical_families",
+    "canonical_composites",
     "canonical_metrics",
     "eval_harnesses",
 )
@@ -70,7 +96,67 @@ def ensure_snapshot(
             exc,
             target,
         )
+    assert_manifest_compatible(target)
     return target
+
+
+def assert_manifest_compatible(root: Path) -> None:
+    """Verify the snapshot's `manifest.json` declares a schema_version
+    major matching `EXPECTED_REGISTRY_SCHEMA_MAJOR`. Idempotent.
+
+    Behaviour:
+      - manifest.json missing → log a warning and continue. The
+        registry's publish script (`publish_registry_data.py`) is what
+        writes manifest.json, and older snapshots predate it. We don't
+        want to break old caches; the producer just doesn't get the
+        schema-drift early-warning until the next publish.
+      - manifest.json present but unparseable → raise.
+      - schema_version present but malformed (not "registry.M.N") →
+        raise.
+      - major mismatch → raise `RegistrySchemaMismatch`.
+      - everything else → log the version and continue.
+    """
+    path = root / "manifest.json"
+    if not path.exists():
+        log.warning(
+            "registry.manifest: %s missing; can't validate schema_version. "
+            "Older snapshot? Producer will continue but won't catch "
+            "schema drift. Re-publish the registry to enable.",
+            path,
+        )
+        return
+
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RegistrySchemaMismatch(
+            f"registry manifest at {path} is unreadable ({exc!r})"
+        ) from exc
+
+    sv = manifest.get("schema_version")
+    if not isinstance(sv, str) or not sv.startswith("registry."):
+        raise RegistrySchemaMismatch(
+            f"registry manifest schema_version malformed: {sv!r} "
+            f"(expected 'registry.<major>.<minor>')"
+        )
+
+    parts = sv.split(".")
+    try:
+        major = int(parts[1])
+    except (IndexError, ValueError) as exc:
+        raise RegistrySchemaMismatch(
+            f"registry manifest schema_version unparseable: {sv!r}"
+        ) from exc
+
+    if major != EXPECTED_REGISTRY_SCHEMA_MAJOR:
+        raise RegistrySchemaMismatch(
+            f"registry schema major mismatch: snapshot has {sv!r} "
+            f"(major={major}), producer expects "
+            f"major={EXPECTED_REGISTRY_SCHEMA_MAJOR}. "
+            f"Update the producer or pin to a compatible snapshot."
+        )
+
+    log.info("registry.manifest: schema_version=%s (major matches)", sv)
 
 
 def _resolve_table_path(root: Path, table: str) -> Path | None:

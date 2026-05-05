@@ -26,13 +26,20 @@ from eval_card_backend.canonicalise.sidecars import (
 
 _FACT_DDL = """
 CREATE TABLE fact_results (
-    composite_slug VARCHAR,
-    benchmark_id   VARCHAR,
-    slice_key      VARCHAR,
-    slice_name     VARCHAR,
-    metric_id      VARCHAR,
-    model_key      VARCHAR,
-    org_raw        VARCHAR
+    composite_slug         VARCHAR,
+    benchmark_id           VARCHAR,
+    slice_key              VARCHAR,
+    slice_name             VARCHAR,
+    metric_id              VARCHAR,
+    model_key              VARCHAR,
+    org_raw                VARCHAR,
+    -- Aggregation keys mirror the canonical ids in these synthetic
+    -- tests (no resolution-failure cases). Computed columns let
+    -- positional INSERTs against the original 7-column shape keep
+    -- working unchanged.
+    benchmark_key          VARCHAR AS (benchmark_id),
+    metric_key             VARCHAR AS (metric_id),
+    model_aggregation_key  VARCHAR AS (model_key)
 )
 """
 

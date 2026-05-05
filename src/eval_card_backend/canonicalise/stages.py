@@ -151,10 +151,34 @@ def stage_a_load_eee(con, arrow_table: pa.Table) -> int:
     (`pipeline.run`) builds the table via `sources.eee.load_arrow_table`,
     which validates each record against the vendored upstream Pydantic
     models and casts to the schema derived from the JSON Schema.
+
+    Hard-fails on NULL `source_config`: downstream Stage D's
+    composite_slug fallback regex evaluates to NULL on NULL input, which
+    causes the row to silently disappear from `composites` /
+    `benchmarks` / `evals_view`. A loud failure here is better than a
+    silent dropout — every EEE record is expected to carry a config
+    name; a NULL means upstream contract is broken.
     """
     con.register("eee_raw_arrow", arrow_table)
     con.execute("CREATE TABLE eee_raw AS SELECT * FROM eee_raw_arrow")
     con.unregister("eee_raw_arrow")
+
+    null_cfg_count = con.execute(
+        "SELECT COUNT(*) FROM eee_raw WHERE source_config IS NULL"
+    ).fetchone()[0]
+    if null_cfg_count:
+        sample = con.execute(
+            "SELECT evaluation_id FROM eee_raw "
+            "WHERE source_config IS NULL LIMIT 3"
+        ).fetchall()
+        raise RuntimeError(
+            f"Stage A: {null_cfg_count} EEE record(s) have NULL source_config. "
+            f"Downstream stages can't bucket these into a composite/benchmark. "
+            f"Sample evaluation_ids: {[r[0] for r in sample]}. Either fix "
+            f"upstream EEE to emit a non-null config, or add a coalesce in "
+            f"the source loader if a default makes sense."
+        )
+
     return arrow_table.num_rows
 
 
@@ -293,6 +317,12 @@ _DIM_SCHEMAS: dict[str, list[tuple[str, str]]] = {
         ("lineage_origin_org_id", "VARCHAR"),
         ("open_weights", "BOOLEAN"),
         ("release_date", "VARCHAR"),
+        # JSON-encoded list of modality strings (e.g. ["text","image"]) per
+        # the registry's canonical_models schema. Surfaced unchanged on
+        # `models` dim and unwrapped to VARCHAR[] on `models_view` /
+        # `eval_results_view.model_info.modalities`.
+        ("input_modalities", "VARCHAR"),
+        ("output_modalities", "VARCHAR"),
         ("tags", "VARCHAR"),
         ("metadata", "VARCHAR"),
         ("review_status", "VARCHAR"),
@@ -334,6 +364,39 @@ _DIM_SCHEMAS: dict[str, list[tuple[str, str]]] = {
         ("metadata", "VARCHAR"),
         ("review_status", "VARCHAR"),
     ],
+    # canonical_families — multi-benchmark / multi-composite groupings.
+    # Loaded into the connection so write_hierarchy can read curation
+    # for the family-rooted tree (notes/hierarchy-alignment.md §5.1).
+    # Older registry snapshots that predate Step 2 don't ship this
+    # table; _load_dim falls back to an empty table with this schema
+    # and the hierarchy degrades gracefully (every composite becomes
+    # its own singleton family).
+    "canonical_families": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("category", "VARCHAR"),
+        ("benchmark_ids", "VARCHAR"),
+        ("primary_benchmark_key", "VARCHAR"),
+        ("folder_aliases", "VARCHAR"),
+        ("composite_keys", "VARCHAR"),
+        ("tags", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
+    # canonical_composites — leaderboard-level groupings. Carries
+    # `family_id` (FK to canonical_families.id) so write_hierarchy can
+    # bucket composites under their parent family. Same back-compat
+    # fallback as canonical_families.
+    "canonical_composites": [
+        ("id", "VARCHAR"),
+        ("display_name", "VARCHAR"),
+        ("category", "VARCHAR"),
+        ("source_configs", "VARCHAR"),
+        ("family_id", "VARCHAR"),
+        ("tags", "VARCHAR"),
+        ("metadata", "VARCHAR"),
+        ("review_status", "VARCHAR"),
+    ],
 }
 
 
@@ -365,6 +428,69 @@ def _load_dim(con, name: str, dim_paths: dict) -> None:
         f"CREATE TABLE {name} AS SELECT {', '.join(select_parts)} "
         f"FROM read_parquet('{path}')"
     )
+
+
+def _derive_model_root_id(con) -> None:
+    """Overwrite `canonical_models.root_model_id` with the genuine
+    transitive root for every row.
+
+    The registry populates `root_model_id` only on quantization chains,
+    where the resolver also collapses leaves to the root before reaching
+    the producer. Variant chains — e.g. `grok-4-0407` whose
+    `parent_model_id` is `grok-4` — are not collapsed by the resolver
+    and stay visible as distinct canonical ids on fact rows. Without a
+    transitive walk, signal grouping fragments the same identity across
+    its variants.
+
+    The walk alternates two edge kinds until fixed point: the registry's
+    incoming `root_model_id` (quantization root) and `parent_model_id`
+    (first `variant` edge, derived earlier in this stage from the typed
+    `parents` list). A model with no parent of either kind resolves to
+    itself. Cycle-safe: a revisited node terminates the chain.
+
+    The column is overwritten in place so downstream readers get one
+    coherent meaning of "root model" without having to choose between
+    competing columns.
+    """
+    rows = con.execute(
+        "SELECT id, parent_model_id, root_model_id FROM canonical_models"
+    ).fetchall()
+    variant_parent: dict[str, str | None] = {row[0]: row[1] for row in rows}
+    quant_root: dict[str, str | None] = {row[0]: row[2] for row in rows}
+
+    def walk_to_root(start: str) -> str:
+        visited = {start}
+        current = start
+        while True:
+            qr = quant_root.get(current)
+            if qr and qr != current and qr not in visited:
+                visited.add(qr)
+                current = qr
+                continue
+            vp = variant_parent.get(current)
+            if vp and vp != current and vp not in visited:
+                visited.add(vp)
+                current = vp
+                continue
+            return current
+
+    roots = [(model_id, walk_to_root(model_id)) for model_id in variant_parent]
+
+    if not roots:
+        return
+
+    con.execute("DROP TABLE IF EXISTS _model_root_updates")
+    con.execute("CREATE TEMP TABLE _model_root_updates (id VARCHAR, root VARCHAR)")
+    con.executemany(
+        "INSERT INTO _model_root_updates VALUES (?, ?)", roots
+    )
+    con.execute(
+        "UPDATE canonical_models AS cm "
+        "SET root_model_id = u.root "
+        "FROM _model_root_updates u "
+        "WHERE cm.id = u.id"
+    )
+    con.execute("DROP TABLE _model_root_updates")
 
 
 def stage_a_load_registry(
@@ -403,6 +529,8 @@ def stage_a_load_registry(
     con.execute(
         "UPDATE canonical_models SET parent_model_id = variant_parent_id_udf(parents)"
     )
+
+    _derive_model_root_id(con)
 
     _composites, _families, promotions = taxonomy.load_and_materialise(
         con, registry_root, taxonomy_seed_dir,
@@ -668,6 +796,7 @@ def stage_d_join_dims_and_flatten(con) -> None:
                 rr.*,
                 cb.parent_benchmark_id                                 AS _cb_parent_benchmark_id,
                 cm_model.parent_model_id                               AS _cm_parent_model_id,
+                cm_model.root_model_id                                 AS _cm_root_model_id,
                 c.card                                                 AS _card_payload,
                 CASE WHEN c.card IS NOT NULL THEN rr.benchmark_id ELSE NULL END AS _benchmark_card_id,
                 COALESCE(
@@ -733,8 +862,20 @@ def stage_d_join_dims_and_flatten(con) -> None:
             j.org_raw,       j.org_id,
             j.harness_raw,   j.harness_id,
 
+            -- Aggregation keys: addressable-or-canonical-or-raw. Used by
+            -- group signals (Stage F) and the view layer (Stage J) so
+            -- unresolved rows still pool by raw string and variants
+            -- collapse to their transitive root for headline aggregation.
+            -- `model_aggregation_key` collapses the variant chain via
+            -- `root_model_id`; `model_id` and `model_key` stay
+            -- variant-level for per-row addressability.
+            COALESCE(j._cm_root_model_id, j.model_id, j.model_raw)                       AS model_aggregation_key,
+            COALESCE(j.benchmark_id, j.benchmark_raw)                                    AS benchmark_key,
+            COALESCE(j.metric_id, j.metric_raw)                                          AS metric_key,
+
             j._cb_parent_benchmark_id                                                   AS parent_benchmark_id,
             j._cm_parent_model_id                                                       AS parent_model_id,
+            j._cm_root_model_id                                                         AS root_model_id,
 
             j._composite_slug                                                           AS composite_slug,
             j._composite_display_name                                                   AS composite_display_name,
@@ -829,8 +970,30 @@ def stage_d_join_dims_and_flatten(con) -> None:
 _SENTINEL_DROP_PREDICATE = """
     score = -1.0
     AND (
+        -- (1) Declared scale excludes -1 explicitly: proportion/percent
+        --     metrics or anything with a non-negative min_score.
         (metric_unit IS NOT NULL AND metric_unit IN ('proportion', 'percent'))
         OR (min_score IS NOT NULL AND -1.0 < min_score)
+        -- (2) Inference fallback: when the metric still has NULL meta on
+        --     this row (registry hadn't backfilled metric_unit yet AND
+        --     the EEE per-record fields didn't carry it), look for
+        --     siblings of the same canonical metric on the same
+        --     benchmark that score in [0, 1] — strong indicator the
+        --     metric is a proportion. Without this, HELM `-1` rows on
+        --     accuracy-shaped metrics with sparse meta survive Stage E
+        --     and poison divergence/avg_score downstream.
+        OR (
+            metric_unit IS NULL
+            AND min_score IS NULL
+            AND EXISTS (
+                SELECT 1 FROM fact_results_staging sib
+                WHERE sib.benchmark_key = fact_results_staging.benchmark_key
+                  AND sib.metric_key   = fact_results_staging.metric_key
+                  AND sib.score IS NOT NULL
+                  AND sib.score >= 0.0
+                  AND sib.score <= 1.0
+            )
+        )
     )
 """
 
@@ -995,17 +1158,25 @@ def stage_e_per_row_signals(con) -> StageEStats:
 def stage_f_group_signals(con, snapshot_id: str) -> int:
     """Group-level signal pass. Two distinct groupings:
 
-      - **Provenance** (F.1) — `(model_id, benchmark_id)`. Multi-source /
-        first-party-only is a property of the model's reporting coverage
-        on a benchmark; orthogonal to which metric or which slice. A
-        third-party that reports any metric or slice on the pair counts
-        as cross-party verification.
-      - **Comparability** (F.2) — `(model_id, benchmark_id, slice_key,
-        metric_id)`. Divergence asks whether parties / setups disagree on
-        the same measurement, so the group key is the actual measurement.
-        Slices (e.g. MMLU subjects) are different measurements; folding
-        them into one divergence calculation conflates natural cross-
-        subject score spread with methodological disagreement.
+      - **Provenance** (F.1) — `(model_aggregation_key, benchmark_key)`.
+        Multi-source / first-party-only is a property of the model's
+        reporting coverage on a benchmark; orthogonal to which metric
+        or which slice. A third-party that reports any metric or slice
+        on the pair counts as cross-party verification.
+      - **Comparability** (F.2) — `(model_aggregation_key, benchmark_key,
+        slice_key, metric_key)`. Divergence asks whether parties /
+        setups disagree on the same measurement, so the group key is
+        the actual measurement. Slices (e.g. MMLU subjects) are
+        different measurements; folding them into one divergence
+        calculation conflates natural cross-subject score spread with
+        methodological disagreement.
+
+    Both passes group on `*_key` (canonical-or-raw fallback) rather
+    than the canonical-only `*_id`. This lets reports with unresolved
+    benchmark or metric still pool with each other when their raw
+    strings match, and collapses variant chains to a single root for
+    aggregation (`grok-4-0407` and `grok-4` reports merge into one
+    pool keyed on `grok-4`).
 
     Returns the count of comparability groups whose rows reported >1
     distinct `metric_unit`. A non-zero count means the per-group divergence
@@ -1013,7 +1184,13 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
     unit, and the operator should backfill the registry's metric_unit
     column for the offending canonical metric.
     """
-    # F.1 — provenance, per (model, benchmark)
+    # F.1 — provenance, per (model_aggregation_key, benchmark_key).
+    #
+    # The filter excludes rows where every form of identity is missing
+    # — i.e. neither resolved nor raw — which can happen if EEE
+    # ships a record with no model name, evaluation_name, or metric_name.
+    # Rows that have raw strings but no canonical id still pool here
+    # (their raw string acts as the key).
     con.execute(
         f"""
         CREATE TABLE fact_results_grouped AS
@@ -1022,13 +1199,13 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
                 {org_normalize_sql('org_raw')}
                   AS org_normalized_key
             FROM fact_results_signaled
-            WHERE model_id     IS NOT NULL
-              AND benchmark_id IS NOT NULL
-              AND metric_id    IS NOT NULL
+            WHERE model_aggregation_key IS NOT NULL
+              AND benchmark_key         IS NOT NULL
+              AND metric_key            IS NOT NULL
         ),
         group_orgs AS (
             SELECT
-                model_id, benchmark_id,
+                model_aggregation_key, benchmark_key,
                 COUNT(DISTINCT org_normalized_key)
                   FILTER (WHERE org_normalized_key IS NOT NULL)
                   AS distinct_reporting_orgs
@@ -1042,7 +1219,7 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
             (o.provenance_source_type = 'first_party' AND go.distinct_reporting_orgs = 1)
               AS first_party_only
         FROM org_normalized o
-        JOIN group_orgs go USING (model_id, benchmark_id)
+        JOIN group_orgs go USING (model_aggregation_key, benchmark_key)
         """
     )
 
@@ -1066,7 +1243,7 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
         CREATE TABLE fact_results_grouped_annotated AS
         WITH group_payloads AS (
             SELECT
-                model_id, benchmark_id, slice_key, metric_id,
+                model_aggregation_key, benchmark_key, slice_key, metric_key,
                 array_agg(struct_pack(
                     fact_id                  := fact_id,
                     evaluation_id            := evaluation_id,
@@ -1086,15 +1263,21 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
         ),
         group_annotations AS (
             SELECT
-                model_id, benchmark_id, slice_key, metric_id,
+                model_aggregation_key, benchmark_key, slice_key, metric_key,
                 compute_variant_divergence_udf(group_rows, metric_config)      AS variant,
                 compute_cross_party_divergence_udf(group_rows, metric_config)  AS cross_party
             FROM group_payloads
         )
         SELECT
             fr.*,
-            md5(fr.model_id || '|' || fr.benchmark_id || '|'
-                || COALESCE(fr.slice_key, '') || '|' || fr.metric_id)
+            -- Hash each key separately before concatenation so a `|`
+            -- character inside a raw fallback string can't collide
+            -- with the separator. Each inner md5 produces a fixed-
+            -- width hex digest, making the concatenation unambiguous.
+            md5(md5(fr.model_aggregation_key)
+                || md5(fr.benchmark_key)
+                || md5(COALESCE(fr.slice_key, ''))
+                || md5(fr.metric_key))
               AS comparability_group_id,
             ga.variant.has_variant_divergence       AS has_variant_divergence,
             ga.variant.divergence_magnitude         AS variant_divergence_magnitude,
@@ -1111,20 +1294,27 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
             ga.cross_party.scores_by_organization      AS scores_by_organization
         FROM fact_results_grouped fr
         LEFT JOIN group_annotations ga
-          ON ga.model_id     = fr.model_id
-         AND ga.benchmark_id = fr.benchmark_id
-         AND ga.slice_key IS NOT DISTINCT FROM fr.slice_key
-         AND ga.metric_id    = fr.metric_id
+          ON ga.model_aggregation_key = fr.model_aggregation_key
+         AND ga.benchmark_key         = fr.benchmark_key
+         AND ga.slice_key             IS NOT DISTINCT FROM fr.slice_key
+         AND ga.metric_key            = fr.metric_key
         """
     )
 
     # F.4 — final fact_results: union resolved-with-group-signals + unresolved passthrough
     #
-    # `model_key = COALESCE(model_id, model_raw)` is the row's addressable
-    # identifier. `model_id` stays nullable (canonical-only); `model_key`
-    # is non-null whenever the source supplied any model name. Downstream
-    # stages key joins/groups/routes on `model_key` so unresolved models
-    # surface as first-class records instead of being silently dropped.
+    # `model_key = COALESCE(model_id, model_raw)` is the row's
+    # variant-level addressable identifier (URLs, per-variant fact
+    # rows). `model_aggregation_key = COALESCE(root_model_id, model_id,
+    # model_raw)` is the root-collapsed grouping key (already on the
+    # row from Stage D); the view layer uses it for one-row-per-root
+    # rollups while fact_results retains the variant grain.
+    #
+    # The unresolved passthrough now only fires when the row lacks
+    # raw identity entirely (model_aggregation_key / benchmark_key /
+    # metric_key all NULL) — rare, since Stage C always extracts the
+    # raw strings when the source carries them. Group signals are NULL
+    # on these rows because there is no identity to pool against.
     con.execute(
         f"""
         CREATE TABLE fact_results AS
@@ -1158,18 +1348,51 @@ def stage_f_group_signals(con, snapshot_id: str) -> int:
             CAST(NULL AS INTEGER)                              AS cross_party_org_count,
             CAST(NULL AS MAP(VARCHAR, DOUBLE))                 AS scores_by_organization
         FROM fact_results_signaled fr
-        WHERE fr.model_id IS NULL OR fr.benchmark_id IS NULL OR fr.metric_id IS NULL
+        WHERE fr.model_aggregation_key IS NULL
+           OR fr.benchmark_key         IS NULL
+           OR fr.metric_key            IS NULL
         """
     )
 
-    # Operator-visible counter: which (model, benchmark, metric) groups had
-    # rows reporting more than one distinct metric_unit. Each such group's
-    # variant_threshold_basis was computed against the deterministic-but-
-    # not-row-matching unit picked by the F.2 MAX FILTER aggregation.
+    # Defensive sanity check: the two UNION BY NAME arms above MUST have
+    # identical column sets. UNION BY NAME silently fills NULL when one
+    # arm has a column the other doesn't — that drops signal data on the
+    # floor when a future field gets added to `fact_results_signaled`
+    # without a matching `CAST(NULL AS …)` line in the unresolved-row
+    # passthrough. Re-run the two SELECTs in isolation, compare column
+    # name sets, and fail fast on drift.
+    _resolved_cols = {
+        r[0] for r in con.execute(
+            f"DESCRIBE SELECT TIMESTAMP '{snapshot_id_to_sql(snapshot_id)}' AS snapshot_id, "
+            "* EXCLUDE (card_payload, org_normalized_key, generation_args_json, _completeness), "
+            "COALESCE(model_id, model_raw) AS model_key "
+            "FROM fact_results_grouped_annotated"
+        ).fetchall()
+    }
+    _passthrough_cols = {
+        r[0] for r in con.execute(
+            "DESCRIBE SELECT * FROM fact_results LIMIT 0"
+        ).fetchall()
+    }
+    _drift = _resolved_cols.symmetric_difference(_passthrough_cols)
+    if _drift:
+        raise RuntimeError(
+            f"Stage F.4 column drift between resolved and unresolved "
+            f"UNION arms: {sorted(_drift)}. Add a matching "
+            f"`CAST(NULL AS …) AS <col>` to the passthrough SELECT, or "
+            f"add the column to the EXCLUDE list on the resolved SELECT. "
+            f"UNION ALL BY NAME would otherwise silently NULL these out."
+        )
+
+    # Operator-visible counter: which root-collapsed (model, benchmark,
+    # metric) groups had rows reporting more than one distinct
+    # metric_unit. Each such group's variant_threshold_basis was
+    # computed against the deterministic-but-not-row-matching unit
+    # picked by the F.2 MAX FILTER aggregation.
     n_unit_inconsistent = con.execute(
         """
         SELECT COUNT(*) FROM (
-            SELECT model_id, benchmark_id, metric_id
+            SELECT model_aggregation_key, benchmark_key, metric_key
             FROM fact_results_grouped
             GROUP BY 1, 2, 3
             HAVING COUNT(DISTINCT metric_unit)
@@ -1360,21 +1583,26 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
         ),
         card_missing_per_benchmark AS (
             SELECT
-                benchmark_id,
+                benchmark_key                              AS benchmark_id,
                 MAX(len(list_filter(
                     completeness_missing_required_fields,
                     x -> starts_with(x, 'autobenchmarkcard.')
                 ))) AS card_missing_count
             FROM fact_results
-            WHERE benchmark_id IS NOT NULL
-            GROUP BY benchmark_id
+            WHERE benchmark_key IS NOT NULL
+            GROUP BY benchmark_key
         ),
         base_pairs AS (
-            -- Distinct (composite, benchmark) pairs from fact_results.
-            SELECT DISTINCT composite_slug, benchmark_id
+            -- Distinct (composite, benchmark_key) pairs from fact_results.
+            -- Keying on `benchmark_key` (canonical-or-raw) keeps
+            -- unresolved benchmarks from being silently dropped at the
+            -- dim layer; the LEFT JOIN to canonical_benchmarks below
+            -- harmlessly produces NULLs for raw-only entries and the
+            -- SELECT falls back to the raw string for display.
+            SELECT DISTINCT composite_slug, benchmark_key AS benchmark_id
             FROM fact_results
             WHERE composite_slug IS NOT NULL
-              AND benchmark_id   IS NOT NULL
+              AND benchmark_key  IS NOT NULL
         ),
         composite_displays AS (
             SELECT
@@ -1451,10 +1679,10 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             TIMESTAMP '{sid}' AS snapshot_id,
             cbp.composite_slug,
             cbp.composite_display_name,
-            cb.id AS benchmark_id,
+            cbp.benchmark_id,
 
-            COALESCE(cb.display_name, cb.id)                     AS display_name,
-            COALESCE(cb.display_name, cb.id)                     AS benchmark_display_name,
+            COALESCE(cb.display_name, cbp.benchmark_id)          AS display_name,
+            COALESCE(cb.display_name, cbp.benchmark_id)          AS benchmark_display_name,
             cb.description,
             cb.dataset_repo,
             cb.parent_benchmark_id,
@@ -1512,11 +1740,11 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             cmpb.card_missing_count
 
         FROM composite_benchmark_pairs cbp
-        JOIN canonical_benchmarks cb              ON cb.id = cbp.benchmark_id
-        LEFT JOIN cards_json c                    ON c.benchmark_id = cb.id
-        LEFT JOIN card_missing_per_benchmark cmpb ON cmpb.benchmark_id = cb.id
-        LEFT JOIN family_lookup fl                ON fl.benchmark_id = cb.id
-        LEFT JOIN is_slice_flag isf               ON isf.benchmark_id = cb.id
+        LEFT JOIN canonical_benchmarks cb         ON cb.id = cbp.benchmark_id
+        LEFT JOIN cards_json c                    ON c.benchmark_id = cbp.benchmark_id
+        LEFT JOIN card_missing_per_benchmark cmpb ON cmpb.benchmark_id = cbp.benchmark_id
+        LEFT JOIN family_lookup fl                ON fl.benchmark_id = cbp.benchmark_id
+        LEFT JOIN is_slice_flag isf               ON isf.benchmark_id = cbp.benchmark_id
         """
     )
 
@@ -1536,9 +1764,9 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
                 ANY_VALUE(fr.composite_display_name) AS composite_display_name,
                 ARRAY_AGG(DISTINCT fr.source_config)
                     FILTER (WHERE fr.source_config IS NOT NULL) AS source_configs,
-                COUNT(DISTINCT (fr.benchmark_id, fr.metric_id))
-                    FILTER (WHERE fr.benchmark_id IS NOT NULL
-                            AND fr.metric_id    IS NOT NULL)    AS evals_count
+                COUNT(DISTINCT (fr.benchmark_key, fr.metric_key))
+                    FILTER (WHERE fr.benchmark_key IS NOT NULL
+                            AND fr.metric_key      IS NOT NULL) AS evals_count
             FROM fact_results fr
             WHERE fr.composite_slug IS NOT NULL
             GROUP BY fr.composite_slug
@@ -1591,30 +1819,41 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
         """
     )
 
-    # models.parquet — keyed on `model_key` so unresolved models (no
-    # registry match) surface as first-class rows rather than being
-    # filtered out. `model_id` stays nullable (canonical-only). Registry
-    # fields fall through to NULL for unresolved; `display_name` falls
-    # back to the raw source name; `review_status` is 'unresolved' so
-    # consumers can flag the row visually if they want.
+    # models.parquet — root grain. One row per `model_aggregation_key`
+    # (= transitive variant root for resolved rows, raw string for
+    # unresolved). Variants of the same identity collapse into one row;
+    # `raw_model_ids` and `variant_keys` expose the per-variant strings
+    # and ids that fed into it. `model_id` is the root canonical id (or
+    # NULL when unresolved). Registry display fields are looked up by
+    # joining canonical_models on the root id; `display_name` falls back
+    # to a raw source name; `review_status` is 'unresolved' for rows
+    # that don't match canonical so consumers can flag them.
     con.execute(
         f"""
         CREATE TABLE models AS
         WITH used_models AS (
             SELECT
-                model_key,
-                ANY_VALUE(model_id)                          AS model_id,
-                ANY_VALUE(model_raw)                         AS model_raw
+                model_aggregation_key                             AS model_key,
+                ANY_VALUE(model_raw)                              AS model_raw_sample,
+                ARRAY_AGG(DISTINCT model_raw)
+                    FILTER (WHERE model_raw IS NOT NULL)          AS raw_model_ids,
+                ARRAY_AGG(DISTINCT model_key)
+                    FILTER (WHERE model_key IS NOT NULL)          AS variant_keys,
+                ARRAY_AGG(DISTINCT model_id)
+                    FILTER (WHERE model_id IS NOT NULL)           AS leaf_model_ids
             FROM fact_results
-            WHERE model_key IS NOT NULL
-            GROUP BY model_key
+            WHERE model_aggregation_key IS NOT NULL
+            GROUP BY model_aggregation_key
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
             um.model_key,
-            um.model_id,
+            cm.id                                            AS model_id,
+            um.raw_model_ids,
+            um.variant_keys,
+            um.leaf_model_ids,
 
-            COALESCE(cm.display_name, um.model_raw)         AS display_name,
+            COALESCE(cm.display_name, um.model_raw_sample)   AS display_name,
             cm.developer,
             cm.org_id,
             cm.family,
@@ -1625,6 +1864,11 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             cm.lineage_origin_org_id,
             cm.open_weights,
             cm.release_date,
+            -- Modalities surfaced as VARCHAR[] for the views; on `models`
+            -- dim we keep the JSON-encoded form to round-trip cleanly via
+            -- parquet readers that don't support nested arrays in joins.
+            TRY_CAST(from_json(cm.input_modalities, '["VARCHAR"]') AS VARCHAR[])  AS input_modalities,
+            TRY_CAST(from_json(cm.output_modalities, '["VARCHAR"]') AS VARCHAR[]) AS output_modalities,
             cm.parents                                       AS lineage_parents,
             TRY_CAST(from_json(cm.tags, '["VARCHAR"]') AS VARCHAR[]) AS registry_tags,
             TRY_CAST(cm.metadata AS JSON)                    AS registry_metadata,
@@ -1637,7 +1881,7 @@ def stage_g_materialise_dim_tables(con, snapshot_id: str) -> None:
             co.parent_org_id       AS org_parent_id
 
         FROM used_models um
-        LEFT JOIN canonical_models cm ON cm.id = um.model_id
+        LEFT JOIN canonical_models cm ON cm.id = um.model_key
         LEFT JOIN canonical_orgs co   ON co.id = cm.org_id
         """
     )
@@ -1775,22 +2019,22 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
             FROM benchmarks
         ),
         tris AS (
-            -- Unresolved models (model_id IS NULL) still flow through:
-            -- group/partition/join keys all use `model_key` which is
-            -- `COALESCE(model_id, model_raw)` and non-null by construction.
-            -- Triples are now (composite_slug, model_key, benchmark_id,
-            -- metric_id) — same benchmark reported in two composites
-            -- becomes two rows in the view.
+            -- Triples are at root grain: keyed on
+            -- (composite_slug, model_aggregation_key, benchmark_key,
+            -- metric_key). Variants of the same identity collapse into
+            -- one triple; rows whose model, benchmark, or metric failed
+            -- to resolve still flow through via the raw fallback baked
+            -- into each `*_key`.
             SELECT *
             FROM fact_results
-            WHERE model_key       IS NOT NULL
-              AND benchmark_id    IS NOT NULL
-              AND metric_id       IS NOT NULL
-              AND composite_slug  IS NOT NULL
+            WHERE model_aggregation_key IS NOT NULL
+              AND benchmark_key         IS NOT NULL
+              AND metric_key            IS NOT NULL
+              AND composite_slug        IS NOT NULL
         ),
         tri_agg AS (
             SELECT
-                composite_slug, model_key, model_id, benchmark_id, metric_id,
+                composite_slug, model_aggregation_key, benchmark_key, metric_key,
                 CAST(COUNT(*) AS INTEGER) AS fact_row_count,
                 -- Median rule: prefer first-party scores; fall back to all rows.
                 COALESCE(
@@ -1840,17 +2084,14 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 BOOL_OR(has_reproducibility_gap)         AS triple_has_repro_gap,
                 AVG(completeness_score)                  AS triple_avg_completeness
             FROM tris
-            -- model_id is functionally dependent on model_key (model_key =
-            -- COALESCE(model_id, model_raw)), so grouping by both keeps
-            -- cardinality identical and lets the SELECT pass model_id through.
-            GROUP BY composite_slug, model_key, model_id, benchmark_id, metric_id
+            GROUP BY composite_slug, model_aggregation_key, benchmark_key, metric_key
         ),
         tri_rep_ranked AS (
             -- Pick one representative fact row per triple.
             -- Order: scored rows first → first-party first → lowest evaluation_id.
             SELECT *,
                 ROW_NUMBER() OVER (
-                    PARTITION BY composite_slug, model_key, benchmark_id, metric_id
+                    PARTITION BY composite_slug, model_aggregation_key, benchmark_key, metric_key
                     ORDER BY
                         CASE WHEN score IS NULL THEN 1 ELSE 0 END ASC,
                         CASE WHEN evaluator_relationship = 'first_party' THEN 0 ELSE 1 END ASC,
@@ -1891,6 +2132,18 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 tr.instance_file_path         AS rep_instance_file_path,
                 tr.instance_file_format       AS rep_instance_file_format,
                 tr.instance_rows              AS rep_instance_rows,
+                -- Generation config from the representative fact row.
+                -- Re-assembled into a STRUCT below to round-trip the shape
+                -- the EEE source carried + the frontend's GenerationConfig
+                -- TS interface expects.
+                tr.temperature                AS rep_temperature,
+                tr.top_p                      AS rep_top_p,
+                tr.top_k                      AS rep_top_k,
+                tr.max_tokens                 AS rep_max_tokens,
+                tr.prompt_template            AS rep_prompt_template,
+                tr.reasoning                  AS rep_reasoning,
+                tr.generation_additional_details AS rep_generation_additional_details,
+                m.model_id                    AS m_model_id,
                 m.display_name                AS m_display_name,
                 m.developer                   AS m_developer,
                 m.org_display_name            AS m_org_display_name,
@@ -1898,24 +2151,39 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 m.params_billions             AS m_params_billions,
                 m.release_date                AS m_release_date,
                 m.open_weights                AS m_open_weights,
+                m.input_modalities            AS m_input_modalities,
+                m.output_modalities           AS m_output_modalities,
                 cmet.display_name             AS metric_display_name,
                 b.parent_benchmark_id         AS b_parent_benchmark_id,
                 b.composite_display_name      AS b_composite_display_name,
                 b.family_id                   AS b_family_id,
                 b.family_display_name         AS b_family_display_name,
                 b.is_slice                    AS b_is_slice,
-                bc.category                   AS b_category
+                bc.category                   AS b_category,
+                -- Pulled through so eval_results_view.source_data uses the
+                -- same fill rule as evals_view.source_data (was previously
+                -- hard-coded NULL on this view, causing schema drift).
+                b.display_name                AS b_display_name,
+                b.dataset_repo                AS b_dataset_repo,
+                b.data_format                 AS b_data_format,
+                b.resources                   AS b_resources
             FROM tri_agg ta
-            JOIN tri_rep tr USING (composite_slug, model_key, benchmark_id, metric_id)
-            LEFT JOIN models m              ON m.model_key    = ta.model_key
+            JOIN tri_rep tr USING (composite_slug, model_aggregation_key, benchmark_key, metric_key)
+            -- Join keys are root-grain. `models.model_key` is the
+            -- transitive root id; `benchmarks.benchmark_id` and
+            -- `canonical_metrics.id` are canonical ids — the LEFT JOIN
+            -- harmlessly returns NULLs for raw-only rows that have no
+            -- canonical dim entry, and per-row display falls back to
+            -- the raw string baked into the key.
+            LEFT JOIN models m              ON m.model_key    = ta.model_aggregation_key
             LEFT JOIN benchmarks b          ON b.composite_slug = ta.composite_slug
-                                            AND b.benchmark_id  = ta.benchmark_id
+                                            AND b.benchmark_id  = ta.benchmark_key
             LEFT JOIN benchmark_categories bc ON bc.composite_slug = ta.composite_slug
-                                              AND bc.benchmark_id  = ta.benchmark_id
-            LEFT JOIN canonical_metrics cmet ON cmet.id       = ta.metric_id
+                                              AND bc.benchmark_id  = ta.benchmark_key
+            LEFT JOIN canonical_metrics cmet ON cmet.id       = ta.metric_key
         ),
         ranked AS (
-            -- Rank by score within (composite_slug, benchmark_id, metric_id),
+            -- Rank by score within (composite_slug, benchmark_key, metric_key),
             -- honouring lower_is_better. NULL scores sort last and get
             -- position=NULL. COUNT(rep_score) over the partition counts
             -- non-NULL scores.
@@ -1923,35 +2191,44 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 CASE
                     WHEN rep_score IS NULL THEN NULL
                     ELSE CAST(ROW_NUMBER() OVER (
-                        PARTITION BY composite_slug, benchmark_id, metric_id
+                        PARTITION BY composite_slug, benchmark_key, metric_key
                         ORDER BY
                             CASE WHEN rep_score IS NULL THEN 1 ELSE 0 END ASC,
                             CASE WHEN COALESCE(rep_lower_is_better, FALSE)
                                  THEN rep_score
                                  ELSE -rep_score
                             END ASC,
-                            model_key ASC
+                            model_aggregation_key ASC
                     ) AS INTEGER)
                 END AS position,
                 CAST(COUNT(rep_score) OVER (
-                    PARTITION BY composite_slug, benchmark_id, metric_id
+                    PARTITION BY composite_slug, benchmark_key, metric_key
                 ) AS INTEGER) AS total
             FROM joined
         )
         SELECT
             TIMESTAMP '{sid}' AS snapshot_id,
-            url_encode_udf(composite_slug || '/' || benchmark_id) AS evaluation_id,
-            metric_summary_id_udf(benchmark_id, metric_id)       AS metric_summary_id,
+            url_encode_udf(composite_slug || '/' || benchmark_key) AS evaluation_id,
+            metric_summary_id_udf(benchmark_key, metric_key)       AS metric_summary_id,
             composite_slug,
             b_composite_display_name                             AS composite_display_name,
-            benchmark_id,
+            benchmark_key                                        AS benchmark_id,
             b_family_id                                          AS family_id,
             b_family_display_name                                AS family_display_name,
             COALESCE(b_is_slice, FALSE)                          AS is_slice,
-            metric_id,
-            model_key,
-            model_id,
-            url_encode_udf(model_key)                            AS model_route_id,
+            -- parent_benchmark_id mirrors the contract on
+            -- comparison-index (notes/hierarchy-alignment.md §5.2):
+            -- null for roots, the parent benchmark id for slices.
+            -- The dim sometimes stores parent_benchmark_id == benchmark_id
+            -- for roots, so gate on is_slice rather than trusting the raw
+            -- column value.
+            CASE WHEN COALESCE(b_is_slice, FALSE)
+                 THEN b_parent_benchmark_id
+                 ELSE NULL END                                   AS parent_benchmark_id,
+            metric_key                                           AS metric_id,
+            model_aggregation_key                                AS model_key,
+            m_model_id                                           AS model_id,
+            url_encode_udf(model_aggregation_key)                AS model_route_id,
 
             -- model_info: denormalised display context. `id` reflects the
             -- canonical id when known and falls back to the raw source name
@@ -1969,15 +2246,52 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                                           ELSE NULL END,
                 'release_date':      m_release_date,
                 'model_url':         NULL,
-                'open_weights':      m_open_weights
+                'open_weights':      m_open_weights,
+                'modalities':        {{
+                    'input':  m_input_modalities,
+                    'output': m_output_modalities
+                }}
             }} AS STRUCT(
                 name VARCHAR, id VARCHAR, developer VARCHAR,
                 inference_platform VARCHAR, inference_engine VARCHAR,
                 model_version VARCHAR, architecture VARCHAR,
                 parameter_count VARCHAR, release_date VARCHAR,
                 model_url VARCHAR,
-                open_weights BOOLEAN
+                open_weights BOOLEAN,
+                modalities STRUCT(input VARCHAR[], output VARCHAR[])
             )) AS model_info,
+
+            -- generation_config: re-assembled from the representative fact
+            -- row's exploded fields. Mirrors `lib/benchmark-schema.ts`'s
+            -- `GenerationConfig` interface — `generation_args` carries the
+            -- decoder knobs (temperature/top_p/top_k/max_tokens/reasoning),
+            -- `prompt_template` is the surface form, `additional_details`
+            -- is the EEE catch-all JSON. `num_few_shot` isn't tracked in
+            -- the producer's flattening (Stage D drops it); reserved as
+            -- NULL until upstream EEE rows surface it.
+            CAST({{
+                'num_few_shot':       NULL,
+                'generation_args':    {{
+                    'temperature': rep_temperature,
+                    'top_p':       rep_top_p,
+                    'top_k':       rep_top_k,
+                    'max_tokens':  rep_max_tokens,
+                    'reasoning':   rep_reasoning
+                }},
+                'additional_details': rep_generation_additional_details,
+                'prompt_template':    rep_prompt_template
+            }} AS STRUCT(
+                num_few_shot       INTEGER,
+                generation_args    STRUCT(
+                    temperature DOUBLE,
+                    top_p       DOUBLE,
+                    top_k       DOUBLE,
+                    max_tokens  INTEGER,
+                    reasoning   BOOLEAN
+                ),
+                additional_details VARCHAR,
+                prompt_template    VARCHAR
+            )) AS generation_config,
 
             metric_display_name,
             rep_metric_unit                                       AS metric_unit,
@@ -2040,15 +2354,19 @@ def stage_j_eval_results_view(con, snapshot_id: str) -> None:
                 publication_date DATE
             )) AS source_metadata,
 
-            -- source_data is producer-NULL today: EEE evaluation_results[].source_data
-            -- isn't carried onto fact_results. STRUCT shape preserved for the consumer.
+            -- source_data: populated from the benchmark dim (same fill
+            -- rule as evals_view.source_data). Was previously hard-coded
+            -- NULL here, which was schema drift across the two views.
+            -- The per-row EEE evaluation_results[].source_data isn't yet
+            -- threaded through fact_results, so we surface the
+            -- benchmark-level dataset metadata as a substitute.
             CAST({{
-                'dataset_name':    NULL,
-                'source_type':     NULL,
-                'hf_repo':         NULL,
+                'dataset_name':    b_display_name,
+                'source_type':     b_data_format,
+                'hf_repo':         b_dataset_repo,
                 'hf_split':        NULL,
                 'samples_number':  NULL,
-                'url':             NULL,
+                'url':             b_resources,
                 'dataset_url':     NULL,
                 'dataset_version': NULL
             }} AS STRUCT(
@@ -2145,12 +2463,14 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
         f"""
         CREATE TABLE models_view AS
         WITH fact_aggs AS (
-            -- Per-fact-row rollups: evidence_count, variant_count_setup,
-            -- generation-config gaps, latest timestamp, evaluator names.
-            -- Keyed on `model_key` so unresolved models are aggregated as
-            -- their own rows rather than being silently dropped.
+            -- Per-fact-row rollups at root grain: evidence_count,
+            -- variant_count_setup, generation-config gaps, latest
+            -- timestamp, evaluator names. Aggregating by
+            -- `model_aggregation_key` collapses variants of the same
+            -- identity into one row and matches the grain of
+            -- `triple_aggs` (which reads from eval_results_view).
             SELECT
-                model_key,
+                model_aggregation_key                            AS model_key,
                 CAST(COUNT(*) AS BIGINT)                    AS evidence_count,
                 CAST(COUNT(DISTINCT variant_key) AS INTEGER) AS variant_count,
                 CAST(COUNT(*) FILTER (
@@ -2182,7 +2502,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                        OR eval_library_version IS NOT NULL
                 )                                             AS eval_libraries
             FROM fact_results
-            WHERE model_key IS NOT NULL
+            WHERE model_aggregation_key IS NOT NULL
             GROUP BY 1
         ),
         triple_aggs AS (
@@ -2292,7 +2612,11 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
             m.model_key                                 AS id,
             url_encode_udf(m.model_key)                 AS route_id,
             url_encode_udf(m.model_key)                 AS model_route_id,
-            COALESCE(m.parent_model_id, m.model_key)    AS model_family_id,
+            -- model_family_id is the transitive root of the variant
+            -- chain. Because `models.model_key` already collapses to the
+            -- root via Stage A's `_derive_model_root_id`, the family
+            -- key is simply `model_key` here — no parent-walk needed.
+            m.model_key                                 AS model_family_id,
 
             m.display_name                              AS model_name,
             m.display_name                              AS canonical_model_name,
@@ -2305,6 +2629,11 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
             CAST(NULL AS VARCHAR)                       AS params,
             m.params_billions,
             m.open_weights                              AS open_weights,
+            -- Modalities pulled through from canonical_models. NULL when
+            -- registry has no data; frontend treats NULL the same as []
+            -- (no modality affordance shown).
+            m.input_modalities                          AS input_modalities,
+            m.output_modalities                         AS output_modalities,
             m.root_model_id                             AS root_model_id,
             m.lineage_origin_org_id                     AS lineage_origin_org_id,
             CAST(NULL AS VARCHAR)                       AS inference_engine,
@@ -2398,7 +2727,7 @@ def stage_j_models_view(con, snapshot_id: str) -> None:
                 'variant_label':        m.display_name,
                 'variant_display_name': m.display_name,
                 'raw_model_ids':        fa.raw_model_ids,
-                'family_id':            COALESCE(m.parent_model_id, m.model_key),
+                'family_id':            m.model_key,
                 'family_name':          m.family,
                 'version_date':         CAST(NULL AS VARCHAR),
                 'version_qualifier':    CAST(NULL AS VARCHAR),
@@ -2702,31 +3031,36 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             GROUP BY 1, 2
         ),
         per_slice_metric AS (
-            -- One row per (composite_slug, benchmark_id, slice_key, metric_id).
-            -- Reads from fact_results because eval_results_view
-            -- collapses to one row per (composite, model, benchmark,
-            -- metric) and doesn't carry slice_key. Mirrors the
-            -- per_metric CTE so the subtask metrics list matches
-            -- root_metrics field-for-field.
+            -- One row per (composite_slug, benchmark_key, slice_key,
+            -- metric_key). Reads from fact_results because
+            -- eval_results_view collapses to one row per (composite,
+            -- model, benchmark, metric) and doesn't carry slice_key.
+            -- Keys (canonical-or-raw) are used so unresolved benchmarks
+            -- and metrics still surface their slices, mirroring the
+            -- root listing's `root_metrics` field-for-field.
+            -- `metric_models_count` is at root grain so it matches
+            -- root_metrics, which sources from eval_results_view (also
+            -- root grain).
             SELECT
                 fr.composite_slug,
-                fr.benchmark_id,
+                fr.benchmark_key                   AS benchmark_id,
                 fr.slice_key,
-                fr.metric_id,
+                fr.metric_key                      AS metric_id,
                 MIN(fr.slice_name)                 AS slice_name_rep,
                 ANY_VALUE(cmet.display_name)       AS metric_display_name,
                 ANY_VALUE(fr.metric_unit)          AS metric_unit,
                 ANY_VALUE(fr.lower_is_better)      AS lower_is_better,
-                CAST(COUNT(DISTINCT fr.model_key) AS INTEGER) AS metric_models_count,
+                CAST(COUNT(DISTINCT fr.model_aggregation_key) AS INTEGER)
+                                                   AS metric_models_count,
                 CASE WHEN COALESCE(ANY_VALUE(fr.lower_is_better), FALSE)
                      THEN MIN(fr.score) ELSE MAX(fr.score) END AS top_score
             FROM fact_results fr
-            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_id
-            WHERE fr.composite_slug IS NOT NULL
-              AND fr.benchmark_id IS NOT NULL
-              AND fr.slice_key    IS NOT NULL
-              AND fr.metric_id    IS NOT NULL
-              AND fr.model_key    IS NOT NULL
+            LEFT JOIN canonical_metrics cmet ON cmet.id = fr.metric_key
+            WHERE fr.composite_slug         IS NOT NULL
+              AND fr.benchmark_key          IS NOT NULL
+              AND fr.slice_key              IS NOT NULL
+              AND fr.metric_key             IS NOT NULL
+              AND fr.model_aggregation_key  IS NOT NULL
             GROUP BY 1, 2, 3, 4
         ),
         slice_metrics_agg AS (
@@ -2779,6 +3113,14 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
             b.family_id,
             b.family_display_name,
             b.is_slice,
+            -- parent_benchmark_id mirrors the contract on
+            -- comparison-index (notes/hierarchy-alignment.md §5.2):
+            -- null for roots, the parent benchmark id for slices.
+            -- The dim sometimes stores parent_benchmark_id == benchmark_id
+            -- for roots, so gate on is_slice rather than trusting the raw
+            -- column value.
+            CASE WHEN b.is_slice THEN b.parent_benchmark_id ELSE NULL END
+                                                        AS parent_benchmark_id,
             pm.metric_id                                AS primary_metric_id,
 
             b.display_name                              AS evaluation_name,
@@ -2998,6 +3340,37 @@ def stage_j_evals_view(con, snapshot_id: str) -> None:
                                               AND ins.benchmark_id  = b.benchmark_id
         LEFT JOIN subtasks_agg            sub ON sub.composite_slug = b.composite_slug
                                               AND sub.benchmark_id  = b.benchmark_id
+        -- Drop fact-less parent shells. The benchmarks dim deliberately
+        -- includes parent benchmarks that have no own fact rows (so the
+        -- hierarchy graph is complete — see _synthesise_singleton_families
+        -- and the parent-only DISTINCT branch). But evals_view is the
+        -- user-facing eval list: a row that no model has reported on
+        -- isn't an eval. Aligning with comparison-index, which is built
+        -- from per-(eval, metric) buckets and therefore already excludes
+        -- these shells.
+        WHERE EXISTS (
+            -- benchmarks dim's `benchmark_id` is the canonical-or-raw
+            -- key, so match it against fr.benchmark_key (not the
+            -- canonical-only fr.benchmark_id) — otherwise raw-only
+            -- benchmark rows in the dim never find their fact rows
+            -- and get dropped from evals_view.
+            SELECT 1 FROM fact_results fr
+            WHERE fr.composite_slug = b.composite_slug
+              AND fr.benchmark_key  = b.benchmark_id
+        )
+        -- Drop leaderboard rollup metrics that EEE ships as if they
+        -- were benchmark names. HELM family ("Mean win rate", "Mean
+        -- score"), BFCL ("overall"), facts-grounding ("score"), etc.
+        -- These are composite-level aggregate scores; surfacing them
+        -- as standalone evals is misleading. Step 3's hierarchy
+        -- reshape will surface them as composite rollup metrics in
+        -- hierarchy.json. Match case-insensitively because EEE's
+        -- casing is inconsistent ("Mean win rate" vs "Mean score").
+        AND LOWER(b.benchmark_id) NOT IN (
+            'mean win rate', 'mean score', 'overall', 'overall score',
+            'score', 'aggregate', 'aggregate score', 'mean', 'total',
+            'total score', 'all', 'rank', 'elo', 'average'
+        )
         ORDER BY b.composite_slug, b.benchmark_id
         """
     )
